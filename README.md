@@ -12,6 +12,25 @@ picocdn namespace create --auth-file ./auth.json default
 picocdn serve -addr 127.0.0.1:8080 -data-dir ./data -auth-file ./auth.json
 ```
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/PiDmitrius/picocdn/main/install.sh | bash
+```
+
+The installer places the binary in `~/.local/bin/picocdn` and prepares the user
+environment for `systemd --user`.
+
+```sh
+picocdn install
+picocdn namespace create --auth-file ~/.local/share/picocdn/auth.json default
+picocdn start
+```
+
+The user service listens on `127.0.0.1:8080` by default, stores data in
+`~/.local/share/picocdn`, and reads optional environment overrides from
+`~/.config/picocdn/picocdn.env`.
+
 Subdomain routing (`https://{namespace}.your-domain.tld/...`) is **opt-in** —
 turn it on by passing `-base-domain your-domain.tld` and putting Caddy with
 wildcard DNS in front. Out of the box you address objects through the path
@@ -27,6 +46,50 @@ Configuration via env or flags:
 | `PICOCDN_BASE_DOMAIN`        | `-base-domain`      | _empty_ (subdomain routing off) |
 | `PICOCDN_MAX_UPLOAD_BYTES`   | `-max-upload-bytes` | `1073741824`         |
 | `PICOCDN_RELOAD_INTERVAL`    | `-reload-interval`  | `5s` (0 disables)    |
+
+## CLI commands
+
+```text
+picocdn install       install binary and systemd user service
+picocdn uninstall     remove systemd user service
+picocdn start         start the service (--foreground to run directly)
+picocdn stop          stop the service
+picocdn restart       restart the service
+picocdn status        show service status
+picocdn update        update from GitHub release or rebuild from source_dir
+picocdn fallback      install latest or selected GitHub release
+picocdn config        show or edit local config
+picocdn namespace     manage namespaces in auth.json
+picocdn token         manage namespace tokens in auth.json
+picocdn backup        write backup tarball
+picocdn restore       restore backup tarball
+picocdn gc            remove unreferenced blobs
+picocdn version       print version
+```
+
+## Update flow
+
+`picocdn update` behaves in one of two ways:
+
+- If `source_dir` is empty, it downloads the latest GitHub release and installs it.
+- If `source_dir` is set, it bumps the local patch version, rebuilds from source,
+  and installs that binary instead.
+
+Local development setup:
+
+```sh
+picocdn config set-source-dir "$(pwd)"
+picocdn update
+```
+
+Fallback to a release build:
+
+```sh
+picocdn fallback          # latest release
+picocdn fallback v0.1.0   # selected release
+```
+
+Release builds are published when a `v*` tag is pushed.
 
 ## API
 

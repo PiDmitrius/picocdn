@@ -19,10 +19,12 @@ import (
 	"syscall"
 	"time"
 
-	"picocdn/internal/auth"
-	"picocdn/internal/server"
-	"picocdn/internal/store"
+	"github.com/PiDmitrius/picocdn/internal/auth"
+	"github.com/PiDmitrius/picocdn/internal/server"
+	"github.com/PiDmitrius/picocdn/internal/store"
 )
+
+const version = "0.1.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -40,6 +42,27 @@ func run(args []string) error {
 	}
 
 	switch args[0] {
+	case "start":
+		if len(args) > 1 && args[1] == "--foreground" {
+			return runServe(args[2:])
+		}
+		return runServiceStart()
+	case "stop":
+		return runServiceCtl("stop")
+	case "restart":
+		return runServiceCtl("restart")
+	case "status":
+		return runStatus()
+	case "install":
+		return runInstall()
+	case "uninstall":
+		return runUninstall()
+	case "update":
+		return runUpdate()
+	case "fallback":
+		return runFallback(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "namespace":
 		return runNamespace(args[1:])
 	case "token":
@@ -51,7 +74,8 @@ func run(args []string) error {
 	case "restore":
 		return runRestore(args[1:])
 	case "version":
-		return printJSON(map[string]string{"version": "0.1.0"})
+		fmt.Printf("picocdn %s\n", version)
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"picocdn/internal/auth"
-	"picocdn/internal/store"
+	"github.com/PiDmitrius/picocdn/internal/auth"
+	"github.com/PiDmitrius/picocdn/internal/store"
 )
 
 type Config struct {
