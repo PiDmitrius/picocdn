@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"picocdn/internal/auth"
+	"github.com/PiDmitrius/picocdn/internal/auth"
 )
 
 // putReq builds a PUT request. `host` may be empty for default localhost.

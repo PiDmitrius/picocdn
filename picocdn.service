@@ -1,0 +1,18 @@
+[Unit]
+Description=picocdn
+After=network.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+Environment=PICOCDN_ADDR=127.0.0.1:8080
+Environment=PICOCDN_DATA_DIR=%h/.local/share/picocdn
+Environment=PICOCDN_AUTH_FILE=%h/.local/share/picocdn/auth.json
+EnvironmentFile=-%h/.config/picocdn/picocdn.env
+ExecStart=%h/.local/bin/picocdn start --foreground
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
