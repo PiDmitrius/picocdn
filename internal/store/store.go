@@ -132,6 +132,22 @@ func (s *Store) GetObject(namespace, objectPath string) (*Object, error) {
 	return &obj, nil
 }
 
+// DeleteNamespaceAliases removes <aliases-root>/<namespace> recursively. Blobs
+// are intentionally left behind for GC to reclaim. Missing dir is not an error.
+func (s *Store) DeleteNamespaceAliases(namespace string) error {
+	if !isValidNamespace(namespace) {
+		return errInvalidNamespace
+	}
+	dir := filepath.Join(s.aliasesRoot, namespace)
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if err := syncDir(s.aliasesRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) DeleteObject(namespace, objectPath string) (*Object, error) {
 	obj, err := s.GetObject(namespace, objectPath)
 	if err != nil {

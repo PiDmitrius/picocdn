@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,29 +21,29 @@ import (
 type Config struct {
 	Addr            string
 	DataDir         string
-	AuthFile        string
 	BaseDomain      string
 	MaxUploadBytes  int64
-	ReloadInterval  time.Duration
 	TrustedProxyIPs []string
 }
 
 type Server struct {
 	cfg        Config
 	logger     *slog.Logger
-	auth       *auth.Reloader
+	auth       *auth.Store
 	store      *store.Store
 	mux        *http.ServeMux
 	hostSuffix string // "."+BaseDomain precomputed once, "" disables subdomain routing
 }
 
-func New(cfg Config, logger *slog.Logger) (*Server, error) {
+func New(cfg Config, authStore *auth.Store, blobStore *store.Store, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	reloader, err := auth.NewReloader(cfg.AuthFile, logger)
-	if err != nil {
-		return nil, err
+	if authStore == nil {
+		return nil, fmt.Errorf("auth store is required")
+	}
+	if blobStore == nil {
+		return nil, fmt.Errorf("blob store is required")
 	}
 	baseDomain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.BaseDomain), "."))
 	hostSuffix := ""
@@ -54,8 +53,8 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 	s := &Server{
 		cfg:        cfg,
 		logger:     logger,
-		auth:       reloader,
-		store:      store.New(cfg.DataDir),
+		auth:       authStore,
+		store:      blobStore,
 		mux:        http.NewServeMux(),
 		hostSuffix: hostSuffix,
 	}
@@ -67,25 +66,14 @@ var recorderPool = sync.Pool{
 	New: func() any { return &responseRecorder{} },
 }
 
-func (s *Server) AuthReloader() *auth.Reloader {
-	return s.auth
-}
-
-func (s *Server) StartReloadWatcher(ctx context.Context) {
-	if s.cfg.ReloadInterval <= 0 {
-		return
-	}
-	go s.auth.Watch(ctx, s.cfg.ReloadInterval)
-}
-
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := recorderPool.Get().(*responseRecorder)
 	rw.reset(w)
 	defer recorderPool.Put(rw)
 
 	start := time.Now()
-	if namespace, ok := s.namespaceFromHost(r.Host); ok && r.URL.Path != "/healthz" {
-		s.dispatch(rw, r, namespace, r.URL.Path)
+	if namespace, ok := s.namespaceFromHost(r.Host); ok && r.URL.Path != "/healthz" && !strings.HasPrefix(r.URL.Path, "/_/") {
+		s.dispatchObject(rw, r, namespace, r.URL.Path)
 	} else {
 		s.mux.ServeHTTP(rw, r)
 	}
@@ -96,6 +84,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"status", rw.status,
 		"bytes", rw.bytes,
 		"ms", time.Since(start).Milliseconds(),
+		"actor", rw.actor,
 		"remote", clientIP(r),
 		"ua", r.Header.Get("User-Agent"),
 	)
@@ -103,25 +92,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	// Path-fallback for dev / local: <host>/<namespace>[/<path>].
+
+	// Admin plane under /_/. Namespace names cannot start with `_`, so this
+	// prefix never collides with object-plane routing.
+	s.mux.HandleFunc("POST /_/namespaces", s.handleAdminNamespaceCreate)
+	s.mux.HandleFunc("GET /_/namespaces", s.handleAdminNamespaceList)
+	s.mux.HandleFunc("DELETE /_/namespaces/{ns}", s.handleAdminNamespaceDelete)
+	s.mux.HandleFunc("POST /_/namespaces/{ns}/rotate-owner", s.handleAdminRotateOwner)
+	s.mux.HandleFunc("POST /_/namespaces/{ns}/tokens", s.handleAdminTokenCreate)
+	s.mux.HandleFunc("GET /_/namespaces/{ns}/tokens", s.handleAdminTokenList)
+	s.mux.HandleFunc("DELETE /_/namespaces/{ns}/tokens/{id}", s.handleAdminTokenRevoke)
+	s.mux.HandleFunc("POST /_/namespaces/{ns}/public", s.handleAdminSetPublic)
+
+	// Object plane.
 	s.mux.HandleFunc("/{namespace}", s.handlePathFallback)
 	s.mux.HandleFunc("/{namespace}/{objectPath...}", s.handlePathFallback)
 }
 
-func (s *Server) handlePathFallback(w http.ResponseWriter, r *http.Request) {
-	namespace := r.PathValue("namespace")
-	objectPath := r.PathValue("objectPath")
-	if objectPath == "" {
-		s.dispatch(w, r, namespace, "/")
-		return
-	}
-	s.dispatch(w, r, namespace, "/"+objectPath)
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+	})
 }
 
-// dispatch routes a request once namespace and the in-namespace URL path are
-// known. urlPath is "/" for the namespace root (list) and "/foo/bar" for an
-// object operation.
-func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, namespace, urlPath string) {
+func (s *Server) handlePathFallback(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	if err := auth.ValidateNamespaceName(namespace); err != nil {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	objectPath := r.PathValue("objectPath")
+	if objectPath == "" {
+		s.dispatchObject(w, r, namespace, "/")
+		return
+	}
+	s.dispatchObject(w, r, namespace, "/"+objectPath)
+}
+
+// dispatchObject routes object-plane requests. urlPath is "/" for namespace
+// root (listing) and "/foo/bar" for an object operation.
+func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, namespace, urlPath string) {
 	switch r.Method {
 	case http.MethodGet:
 		if urlPath == "/" {
@@ -154,13 +165,6 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, namespace, url
 		w.Header().Set("Allow", "GET, HEAD, PUT, DELETE")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-}
-
-func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
-	})
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, namespace, objectPath string) {
@@ -311,6 +315,236 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, namespace, ob
 	http.ServeContent(w, r, path.Base(obj.Path), stat.ModTime(), file)
 }
 
+// --- Admin handlers ---
+
+type namespaceCreateRequest struct {
+	Name string `json:"name"`
+}
+
+type tokenCreateRequest struct {
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+}
+
+type publicRequest struct {
+	On bool `json:"on"`
+}
+
+func (s *Server) handleAdminNamespaceCreate(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireRoot(w, r)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	var req namespaceCreateRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	created, err := s.auth.CreateNamespace(req.Name)
+	if errors.Is(err, auth.ErrNamespaceExists) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, auth.ErrInvalidNamespaceName) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		s.logger.Warn("namespace create failed", "err", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"namespace":      created.Namespace,
+		"owner_token_id": created.TokenID,
+		"owner_token":    created.Token,
+	})
+}
+
+func (s *Server) handleAdminNamespaceList(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireRoot(w, r)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.auth.ListNamespaces())
+}
+
+func (s *Server) handleAdminNamespaceDelete(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireRoot(w, r)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.auth.DeleteNamespace(name); err != nil {
+		if errors.Is(err, auth.ErrNamespaceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		s.logger.Warn("namespace delete failed", "err", err, "namespace", name)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.store.DeleteNamespaceAliases(name); err != nil {
+		s.logger.Warn("alias cleanup failed", "err", err, "namespace", name)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminRotateOwner(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireRoot(w, r)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	created, err := s.auth.RotateOwner(name)
+	if errors.Is(err, auth.ErrNamespaceNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.logger.Warn("rotate owner failed", "err", err, "namespace", name)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"namespace":      created.Namespace,
+		"owner_token_id": created.TokenID,
+		"owner_token":    created.Token,
+	})
+}
+
+func (s *Server) handleAdminTokenCreate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor, ok := s.requireNamespaceAdmin(w, r, name)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	var req tokenCreateRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	created, err := s.auth.CreateToken(name, req.Name, req.Permissions)
+	if errors.Is(err, auth.ErrNamespaceNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(created)
+}
+
+func (s *Server) handleAdminTokenList(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor, ok := s.requireNamespaceAdmin(w, r, name)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	tokens, err := s.auth.ListTokens(name)
+	if errors.Is(err, auth.ErrNamespaceNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(tokens)
+}
+
+func (s *Server) handleAdminTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor, ok := s.requireNamespaceAdmin(w, r, name)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	id := r.PathValue("id")
+	err := s.auth.RevokeToken(name, id)
+	if errors.Is(err, auth.ErrNamespaceNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if errors.Is(err, auth.ErrTokenNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if errors.Is(err, auth.ErrCannotRevokeOwner) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminSetPublic(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor, ok := s.requireNamespaceAdmin(w, r, name)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	var req publicRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if err := s.auth.SetPublicRead(name, req.On); err != nil {
+		if errors.Is(err, auth.ErrNamespaceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"namespace":   name,
+		"public_read": req.On,
+	})
+}
+
+// --- Authorization helpers ---
+
 func (s *Server) namespaceFromHost(host string) (string, bool) {
 	if s.hostSuffix == "" {
 		return "", false
@@ -321,8 +555,6 @@ func (s *Server) namespaceFromHost(host string) (string, bool) {
 	if len(host) > 0 && host[len(host)-1] == '.' {
 		host = host[:len(host)-1]
 	}
-	// Fast-path: hosts are typically already lowercase. Only fall back to
-	// strings.ToLower if we see an uppercase letter.
 	if hasUpper(host) {
 		host = strings.ToLower(host)
 	}
@@ -331,6 +563,9 @@ func (s *Server) namespaceFromHost(host string) (string, bool) {
 	}
 	namespace := host[:len(host)-len(s.hostSuffix)]
 	if namespace == "" || strings.IndexByte(namespace, '.') >= 0 {
+		return "", false
+	}
+	if err := auth.ValidateNamespaceName(namespace); err != nil {
 		return "", false
 	}
 	return namespace, true
@@ -356,10 +591,12 @@ func (s *Server) requirePermission(w http.ResponseWriter, r *http.Request, names
 		writeError(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
-	if !s.auth.Authorize(namespace, token, permission) {
+	actor, ok := s.auth.Authorize(namespace, token, permission)
+	if !ok {
 		writeError(w, http.StatusForbidden, "permission denied")
 		return false
 	}
+	setActor(w, actor)
 	return true
 }
 
@@ -369,6 +606,7 @@ func (s *Server) requireReadAccess(w http.ResponseWriter, r *http.Request, names
 		return false
 	}
 	if s.auth.IsPublicRead(namespace) {
+		setActor(w, auth.Actor{Kind: "anon"})
 		return true
 	}
 	token := bearerToken(r)
@@ -376,11 +614,45 @@ func (s *Server) requireReadAccess(w http.ResponseWriter, r *http.Request, names
 		writeError(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
-	if !s.auth.Authorize(namespace, token, "read") {
+	actor, ok := s.auth.Authorize(namespace, token, "read")
+	if !ok {
 		writeError(w, http.StatusForbidden, "permission denied")
 		return false
 	}
+	setActor(w, actor)
 	return true
+}
+
+func (s *Server) requireRoot(w http.ResponseWriter, r *http.Request) (auth.Actor, bool) {
+	token := bearerToken(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing bearer token")
+		return auth.Actor{}, false
+	}
+	actor, ok := s.auth.AuthorizeRoot(token)
+	if !ok {
+		writeError(w, http.StatusForbidden, "root token required")
+		return auth.Actor{}, false
+	}
+	return actor, true
+}
+
+func (s *Server) requireNamespaceAdmin(w http.ResponseWriter, r *http.Request, namespace string) (auth.Actor, bool) {
+	if !s.auth.HasNamespace(namespace) {
+		writeError(w, http.StatusNotFound, "namespace not found")
+		return auth.Actor{}, false
+	}
+	token := bearerToken(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing bearer token")
+		return auth.Actor{}, false
+	}
+	actor, ok := s.auth.AuthorizeNamespaceAdmin(namespace, token)
+	if !ok {
+		writeError(w, http.StatusForbidden, "owner or root token required")
+		return auth.Actor{}, false
+	}
+	return actor, true
 }
 
 func bearerToken(r *http.Request) string {
@@ -391,6 +663,17 @@ func bearerToken(r *http.Request) string {
 	return r.Header.Get("X-Picocdn-Token")
 }
 
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return false
+	}
+	return true
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -399,11 +682,18 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
+func setActor(w http.ResponseWriter, actor auth.Actor) {
+	if rr, ok := w.(*responseRecorder); ok {
+		rr.actor = actor.String()
+	}
+}
+
 type responseRecorder struct {
 	http.ResponseWriter
 	status      int
 	bytes       int64
 	wroteHeader bool
+	actor       string
 }
 
 func (r *responseRecorder) reset(w http.ResponseWriter) {
@@ -411,6 +701,7 @@ func (r *responseRecorder) reset(w http.ResponseWriter) {
 	r.status = http.StatusOK
 	r.bytes = 0
 	r.wroteHeader = false
+	r.actor = ""
 }
 
 func (r *responseRecorder) WriteHeader(status int) {

@@ -139,7 +139,6 @@ StartLimitIntervalSec=60
 Type=simple
 Environment=PICOCDN_ADDR=127.0.0.1:8080
 Environment=PICOCDN_DATA_DIR=%%h/.local/share/picocdn
-Environment=PICOCDN_AUTH_FILE=%%h/.local/share/picocdn/auth.json
 EnvironmentFile=-%%h/.config/picocdn/picocdn.env
 ExecStart=%s start --foreground
 Restart=always
