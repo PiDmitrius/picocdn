@@ -211,6 +211,60 @@ func TestAuthRequired(t *testing.T) {
 	}
 }
 
+// TestNamespaceExistenceNotLeaked verifies that an unauthenticated caller
+// or a caller with a wrong-scope token cannot distinguish a missing
+// namespace from a private one. Both must return 401, never 404.
+func TestNamespaceExistenceNotLeaked(t *testing.T) {
+	ts := buildServer(t, nil)
+	// anon to private existing ns
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/x.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon private status = %d, want 401", rec.Code)
+	}
+	// anon to missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon missing status = %d, want 401", rec.Code)
+	}
+	// owner-of-default to missing ns must look the same
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", ts.ownerToken, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-ns owner status = %d, want 401", rec.Code)
+	}
+	// only root sees the truth (404) for a missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", ts.rootToken, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("root missing status = %d, want 404", rec.Code)
+	}
+}
+
+// TestAdminExistenceNotLeaked is the same property for the /_/ plane.
+func TestAdminExistenceNotLeaked(t *testing.T) {
+	ts := buildServer(t, nil)
+	// anon
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon admin missing = %d, want 401", rec.Code)
+	}
+	// owner-of-default to missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", ts.ownerToken, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-ns owner admin missing = %d, want 401", rec.Code)
+	}
+	// root distinguishes
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", ts.rootToken, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("root admin missing = %d, want 404", rec.Code)
+	}
+}
+
 func TestDeleteObject(t *testing.T) {
 	ts := buildServer(t, nil)
 	rec := doPut(t, ts.srv, "", "/default/d.txt", ts.ownerToken, "x", "text/plain")
@@ -372,13 +426,14 @@ func TestAdminTokenCreate(t *testing.T) {
 		t.Fatal("missing plaintext token")
 	}
 
-	// sub-token cannot issue
+	// sub-token cannot issue: 401 (unified with cross-namespace/anon to
+	// avoid leaking that the sub-token has any admin-shaped privileges).
 	rec = httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/tokens", resp.Token, map[string]any{
 		"name":        "evil",
 		"permissions": []string{"read"},
 	}))
-	if rec.Code != http.StatusForbidden {
+	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("sub-token issue status = %d", rec.Code)
 	}
 }
@@ -458,9 +513,9 @@ func TestAdminRotateOwner(t *testing.T) {
 	if resp.OwnerToken == "" {
 		t.Fatal("missing new owner token")
 	}
-	// old owner token now rejected
+	// old owner token now rejected: 401 (token is unknown to the store).
 	rec = doPut(t, ts.srv, "", "/default/x.txt", ts.ownerToken, "x", "text/plain")
-	if rec.Code != http.StatusForbidden {
+	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("old owner status = %d", rec.Code)
 	}
 }

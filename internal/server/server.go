@@ -581,18 +581,43 @@ func hasUpper(s string) bool {
 	return false
 }
 
+// requirePermission gates an object-plane write/delete. To prevent
+// namespace-existence enumeration, callers without a valid scope for the
+// target namespace see 401 regardless of whether the namespace exists. Only
+// a valid root token differentiates: it gets 404 when the namespace is
+// missing (root already knows the full namespace list).
 func (s *Server) requirePermission(w http.ResponseWriter, r *http.Request, namespace, permission string) bool {
-	if !s.auth.HasNamespace(namespace) {
-		writeError(w, http.StatusNotFound, "namespace not found")
-		return false
-	}
 	token := bearerToken(r)
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
+	if rootActor, ok := s.auth.AuthorizeRoot(token); ok {
+		if !s.auth.HasNamespace(namespace) {
+			writeError(w, http.StatusNotFound, "namespace not found")
+			return false
+		}
+		setActor(w, rootActor)
+		return true
+	}
+	if !s.auth.HasNamespace(namespace) {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return false
+	}
 	actor, ok := s.auth.Authorize(namespace, token, permission)
 	if !ok {
+		// Distinguish "wrong namespace / unknown token" (401) from
+		// "valid token but missing permission" (403). The namespace
+		// exists at this point; if the token is not registered here
+		// at all, surface 401 — same shape as the cross-namespace case.
+		if _, known := s.auth.Authorize(namespace, token, "read"); !known {
+			if _, knownW := s.auth.Authorize(namespace, token, "write"); !knownW {
+				if _, knownD := s.auth.Authorize(namespace, token, "delete"); !knownD {
+					writeError(w, http.StatusUnauthorized, "invalid token")
+					return false
+				}
+			}
+		}
 		writeError(w, http.StatusForbidden, "permission denied")
 		return false
 	}
@@ -601,10 +626,6 @@ func (s *Server) requirePermission(w http.ResponseWriter, r *http.Request, names
 }
 
 func (s *Server) requireReadAccess(w http.ResponseWriter, r *http.Request, namespace string) bool {
-	if !s.auth.HasNamespace(namespace) {
-		writeError(w, http.StatusNotFound, "namespace not found")
-		return false
-	}
 	if s.auth.IsPublicRead(namespace) {
 		setActor(w, auth.Actor{Kind: "anon"})
 		return true
@@ -614,9 +635,21 @@ func (s *Server) requireReadAccess(w http.ResponseWriter, r *http.Request, names
 		writeError(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
+	if rootActor, ok := s.auth.AuthorizeRoot(token); ok {
+		if !s.auth.HasNamespace(namespace) {
+			writeError(w, http.StatusNotFound, "namespace not found")
+			return false
+		}
+		setActor(w, rootActor)
+		return true
+	}
+	if !s.auth.HasNamespace(namespace) {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return false
+	}
 	actor, ok := s.auth.Authorize(namespace, token, "read")
 	if !ok {
-		writeError(w, http.StatusForbidden, "permission denied")
+		writeError(w, http.StatusUnauthorized, "invalid token")
 		return false
 	}
 	setActor(w, actor)
@@ -637,19 +670,30 @@ func (s *Server) requireRoot(w http.ResponseWriter, r *http.Request) (auth.Actor
 	return actor, true
 }
 
+// requireNamespaceAdmin gates /_/namespaces/{ns}/... endpoints. Same
+// existence-enumeration story as requirePermission: callers who are
+// neither root nor the namespace owner get 401 regardless of whether
+// the namespace exists. Only root sees 404 for a missing namespace.
 func (s *Server) requireNamespaceAdmin(w http.ResponseWriter, r *http.Request, namespace string) (auth.Actor, bool) {
-	if !s.auth.HasNamespace(namespace) {
-		writeError(w, http.StatusNotFound, "namespace not found")
-		return auth.Actor{}, false
-	}
 	token := bearerToken(r)
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "missing bearer token")
 		return auth.Actor{}, false
 	}
+	if rootActor, ok := s.auth.AuthorizeRoot(token); ok {
+		if !s.auth.HasNamespace(namespace) {
+			writeError(w, http.StatusNotFound, "namespace not found")
+			return auth.Actor{}, false
+		}
+		return rootActor, true
+	}
+	if !s.auth.HasNamespace(namespace) {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return auth.Actor{}, false
+	}
 	actor, ok := s.auth.AuthorizeNamespaceAdmin(namespace, token)
 	if !ok {
-		writeError(w, http.StatusForbidden, "owner or root token required")
+		writeError(w, http.StatusUnauthorized, "invalid token")
 		return auth.Actor{}, false
 	}
 	return actor, true

@@ -339,11 +339,11 @@ expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" \
   --data '{"name":"evil","permissions":["owner"]}' \
   "$ADMIN/default/tokens")" "400"
 
-step "POST tokens by sub-token rejected (403)"
+step "POST tokens by sub-token rejected (401, no admin scope)"
 expect "$(http_status -X POST -H "Authorization: Bearer $RW_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{"name":"x","permissions":["read"]}' \
-  "$ADMIN/default/tokens")" "403"
+  "$ADMIN/default/tokens")" "401"
 
 step "GET /_/namespaces/default/tokens lists 2 tokens"
 out=$(admin_call GET "$ADMIN/default/tokens" "$OWNER_TOKEN" 2>&1)
@@ -394,8 +394,8 @@ if [[ "$n" -ge 1 ]]; then ok; else ko "no entries (n=$n)"; fi
 step "missing token on GET returns 401"
 expect "$(http_status "$HOST/docs/hello.txt")" "401"
 
-step "wrong token returns 403"
-expect "$(http_status -H "Authorization: Bearer wrong" "$HOST/docs/hello.txt")" "403"
+step "wrong token returns 401 (unified, no existence leak)"
+expect "$(http_status -H "Authorization: Bearer wrong" "$HOST/docs/hello.txt")" "401"
 
 step "read+write token CAN write (201)"
 echo body > "$WORK/x.txt"
@@ -411,9 +411,14 @@ echo from-root > "$WORK/r.txt"
 expect "$(http_status -X PUT --data-binary @"$WORK/r.txt" \
   -H "Authorization: Bearer $ROOT_TOKEN" "$HOST/root.txt")" "201"
 
-step "PUT to nonexistent namespace returns 404"
+step "PUT to nonexistent namespace via owner token returns 401 (no leak)"
 expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
   -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$BASE/missing/x.txt")" "401"
+
+step "root sees 404 for missing namespace (root knows the list)"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
   "$BASE/missing/x.txt")" "404"
 
 step "encoded %2e%2e traversal rejected (400)"
@@ -452,16 +457,16 @@ out=$(admin_call POST "$ADMIN" "$ROOT_TOKEN" '{"name":"other"}' 2>&1)
 OTHER_OWNER=$(read_json_field "$out" owner_token)
 if [[ -n "$OTHER_OWNER" ]]; then ok; else ko "$out"; fi
 
-step "other owner cannot access default (403)"
+step "cross-namespace token returns 401 (no existence leak)"
 expect "$(http_status -H "Authorization: Bearer $OTHER_OWNER" \
-  "$HOST/docs/hello.txt")" "403"
+  "$HOST/docs/hello.txt")" "401"
 
-step "rotate-owner invalidates old owner (403)"
+step "rotate-owner invalidates old owner (401)"
 new_out=$(admin_call POST "$ADMIN/default/rotate-owner" "$ROOT_TOKEN" 2>&1)
 NEW_OWNER=$(read_json_field "$new_out" owner_token)
 if [[ -n "$NEW_OWNER" ]]; then
   expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
-    -H "Authorization: Bearer $OWNER_TOKEN" "$HOST/after-rotate.txt")" "403"
+    -H "Authorization: Bearer $OWNER_TOKEN" "$HOST/after-rotate.txt")" "401"
 else
   ko "no new owner_token in rotate response"
 fi
@@ -564,13 +569,15 @@ step "PUT at subdomain root (no path) returns 400"
 expect "$(http_status -X PUT -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
   --data-binary @"$WORK/sub.txt" "$BASE/")" "400"
 
-step "base host (example.test) not treated as namespace"
+step "base host (example.test) falls back to path routing"
+# falls into path-fallback /docs/anything; "docs" namespace does not exist
+# and token doesn't match it — unified 401 instead of leaking 404.
 expect "$(http_status -H "Host: example.test" -H "Authorization: Bearer $OWNER_TOKEN" \
-  "$BASE/docs/anything")" "404"
+  "$BASE/docs/anything")" "401"
 
-step "underscore-prefix subdomain not routed as namespace"
+step "underscore-prefix subdomain not routed; falls back to path"
 expect "$(http_status -H "Host: _bad.example.test" -H "Authorization: Bearer $OWNER_TOKEN" \
-  "$BASE/x")" "404"
+  "$BASE/x")" "401"
 
 step "encoded %2e%2e via subdomain rejected (400)"
 expect "$(http_status --path-as-is -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
