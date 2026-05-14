@@ -349,6 +349,12 @@ func runRestore(args []string) error {
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 				return err
 			}
+			if isControlPlanePath(dest, dataDir) {
+				if err := restoreFileAtomic(dest, 0o600, tr); err != nil {
+					return err
+				}
+				continue
+			}
 			f, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
 				return err
@@ -364,23 +370,65 @@ func runRestore(args []string) error {
 			continue
 		}
 	}
-	if err := os.Chmod(configPath(), 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	nsDir := filepath.Join(dataDir, "namespaces")
-	if entries, err := os.ReadDir(nsDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-				continue
-			}
-			_ = os.Chmod(filepath.Join(nsDir, e.Name()), 0o600)
-		}
-	}
 	return printJSON(map[string]string{
 		"status":   "restored",
 		"data_dir": dataDir,
 		"config":   configPath(),
 	})
+}
+
+// isControlPlanePath reports whether dest is an auth-sensitive file that must
+// be written atomically: the root config or any namespace JSON.
+func isControlPlanePath(dest, dataDir string) bool {
+	if dest == configPath() {
+		return true
+	}
+	nsDir := filepath.Join(dataDir, "namespaces") + string(filepath.Separator)
+	if strings.HasPrefix(dest, nsDir) && strings.HasSuffix(dest, ".json") {
+		return true
+	}
+	return false
+}
+
+// restoreFileAtomic writes r to dest via temp+fsync+chmod+rename+dir-fsync so
+// a crash mid-restore never leaves a truncated control-plane file behind.
+func restoreFileAtomic(dest string, mode os.FileMode, r io.Reader) error {
+	dir := filepath.Dir(dest)
+	tmp, err := os.CreateTemp(dir, ".restore-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	keepTmp := false
+	defer func() {
+		if !keepTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, r); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return err
+	}
+	keepTmp = true
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func restoreDest(name, dataDir, configFile string) (string, error) {
