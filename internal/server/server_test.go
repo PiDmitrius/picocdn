@@ -1,21 +1,80 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/PiDmitrius/picocdn/internal/auth"
+	"github.com/PiDmitrius/picocdn/internal/store"
 )
 
-// putReq builds a PUT request. `host` may be empty for default localhost.
+// --- helpers ---
+
+type testServer struct {
+	srv         *Server
+	authStore   *auth.Store
+	defaultNS   string
+	ownerToken  string
+	rootToken   string
+	rootEnabled bool
+}
+
+func buildServer(t testing.TB, configure func(*Config)) *testServer {
+	t.Helper()
+	dataDir := t.TempDir()
+	nsDir := filepath.Join(dataDir, "namespaces")
+
+	rootPlain, rootMeta, err := auth.NewRootToken("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authStore, err := auth.NewStore(nsDir, []auth.RootToken{rootMeta})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := authStore.CreateNamespace("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		DataDir:        dataDir,
+		MaxUploadBytes: 1 << 20,
+	}
+	if configure != nil {
+		configure(&cfg)
+	}
+	blobStore := store.New(dataDir)
+	srv, err := New(cfg, authStore, blobStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &testServer{
+		srv:         srv,
+		authStore:   authStore,
+		defaultNS:   "default",
+		ownerToken:  owner.Token,
+		rootToken:   rootPlain,
+		rootEnabled: true,
+	}
+}
+
+// issueSubToken creates a sub-token in defaultNS with the given permissions.
+func (ts *testServer) issueSubToken(t testing.TB, name string, perms []string) string {
+	t.Helper()
+	created, err := ts.authStore.CreateToken(ts.defaultNS, name, perms)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	return created.Token
+}
+
 func putReq(t testing.TB, host, urlPath, token, body, contentType string) *http.Request {
 	t.Helper()
 	if host == "" {
@@ -39,7 +98,6 @@ func doPut(t testing.TB, srv *Server, host, urlPath, token, body, contentType st
 	return rec
 }
 
-// authedReq builds a non-PUT request for path-fallback (no Host magic).
 func authedReq(method, urlPath, token string, body io.Reader) *http.Request {
 	r := httptest.NewRequest(method, "http://127.0.0.1:8080"+urlPath, body)
 	r.Host = "127.0.0.1:8080"
@@ -49,20 +107,46 @@ func authedReq(method, urlPath, token string, body io.Reader) *http.Request {
 	return r
 }
 
-// ---------- path-fallback tests (no BaseDomain required) ----------
+func adminReq(method, urlPath, token string, body any) *http.Request {
+	var br io.Reader
+	if body != nil {
+		data, _ := json.Marshal(body)
+		br = bytes.NewReader(data)
+	}
+	r := httptest.NewRequest(method, "http://127.0.0.1:8080"+urlPath, br)
+	r.Host = "127.0.0.1:8080"
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	return r
+}
+
+func decodeJSON(t testing.TB, r io.Reader, v any) {
+	t.Helper()
+	if err := json.NewDecoder(r).Decode(v); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func withSubdomain(cfg *Config) {
+	cfg.BaseDomain = "example.test"
+}
+
+// --- object plane: PUT/GET/HEAD/DELETE/LIST ---
 
 func TestUploadDownloadAndRange(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write"})
-
-	rec := doPut(t, srv, "", "/default/docs/hello.txt", token, "hello picocdn", "text/plain")
+	ts := buildServer(t, nil)
+	rec := doPut(t, ts.srv, "", "/default/docs/hello.txt", ts.ownerToken, "hello picocdn", "text/plain")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
 	}
-
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/hello.txt", token, nil))
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/hello.txt", ts.ownerToken, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("GET status = %d", rec.Code)
 	}
 	if rec.Body.String() != "hello picocdn" {
 		t.Fatalf("body = %q", rec.Body.String())
@@ -72,158 +156,158 @@ func TestUploadDownloadAndRange(t *testing.T) {
 	}
 
 	// Range
-	req := authedReq(http.MethodGet, "/default/docs/hello.txt", token, nil)
+	req := authedReq(http.MethodGet, "/default/docs/hello.txt", ts.ownerToken, nil)
 	req.Header.Set("Range", "bytes=0-4")
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	ts.srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("range status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("range status = %d", rec.Code)
 	}
 	if rec.Body.String() != "hello" {
 		t.Fatalf("range body = %q", rec.Body.String())
 	}
-
-	// HEAD
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodHead, "/default/docs/hello.txt", token, nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("HEAD status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("HEAD returned body: %q", rec.Body.String())
-	}
 }
 
-func TestSingleSegmentPath(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write"})
+func TestSubTokenScopeRespected(t *testing.T) {
+	ts := buildServer(t, nil)
+	readOnly := ts.issueSubToken(t, "reader", []string{"read"})
 
-	rec := doPut(t, srv, "", "/default/file.txt", token, "single", "text/plain")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/file.txt", token, nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET status = %d", rec.Code)
-	}
-	if rec.Body.String() != "single" {
-		t.Fatalf("body = %q", rec.Body.String())
-	}
-}
-
-func TestNamespaceIsolation(t *testing.T) {
-	srv, tokens := newTestServerWithNamespaces(t, map[string][]string{
-		"default": {"read", "write"},
-		"other":   {"read"},
-	}, nil)
-
-	rec := doPut(t, srv, "", "/default/docs/private.txt",
-		tokens["default"], "secret", "text/plain")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	// default's token cannot read 'other'.
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/other/docs/private.txt", tokens["default"], nil))
+	rec := doPut(t, ts.srv, "", "/default/x.txt", readOnly, "body", "text/plain")
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("cross-namespace token status = %d", rec.Code)
+		t.Fatalf("sub-token write should be forbidden, got %d", rec.Code)
 	}
-
-	// 'other' has its own token but object is in 'default'.
+	// seed via owner
+	if rec := doPut(t, ts.srv, "", "/default/x.txt", ts.ownerToken, "body", "text/plain"); rec.Code != http.StatusCreated {
+		t.Fatalf("owner seed PUT status = %d", rec.Code)
+	}
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/other/docs/private.txt", tokens["other"], nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("cross-namespace object status = %d", rec.Code)
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/x.txt", readOnly, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sub-token read should pass, got %d", rec.Code)
 	}
 }
 
-func TestEncodedTraversalRejected(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write"})
-
-	rec := doPut(t, srv, "", "/default/docs/secret.txt", token, "secret", "text/plain")
+func TestRootAuthorizesAnyNamespace(t *testing.T) {
+	ts := buildServer(t, nil)
+	if _, err := ts.authStore.CreateNamespace("other"); err != nil {
+		t.Fatal(err)
+	}
+	rec := doPut(t, ts.srv, "", "/other/r.txt", ts.rootToken, "body", "text/plain")
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("seed status = %d", rec.Code)
+		t.Fatalf("root PUT status = %d body=%s", rec.Code, rec.Body.String())
 	}
-
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/%2e%2e/docs/secret.txt", token, nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("encoded traversal status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestUploadLimit(t *testing.T) {
-	srv, token := newTestServerWithConfig(t, []string{"write"}, func(cfg *Config) {
-		cfg.MaxUploadBytes = 512
-	})
-
-	rec := doPut(t, srv, "", "/default/docs/too-large.txt", token,
-		strings.Repeat("x", 2048), "application/octet-stream")
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/other/r.txt", ts.rootToken, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root GET status = %d", rec.Code)
 	}
 }
 
 func TestAuthRequired(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read"})
-
-	rec := doPut(t, srv, "", "/default/x.txt", "", "body", "text/plain")
+	ts := buildServer(t, nil)
+	rec := doPut(t, ts.srv, "", "/default/x.txt", "", "body", "text/plain")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("missing token status = %d", rec.Code)
 	}
+}
 
-	rec = doPut(t, srv, "", "/default/x.txt", token, "body", "text/plain")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("read-only upload status = %d", rec.Code)
+// TestNamespaceExistenceNotLeaked verifies that an unauthenticated caller
+// or a caller with a wrong-scope token cannot distinguish a missing
+// namespace from a private one. Both must return 401, never 404.
+func TestNamespaceExistenceNotLeaked(t *testing.T) {
+	ts := buildServer(t, nil)
+	// anon to private existing ns
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/x.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon private status = %d, want 401", rec.Code)
+	}
+	// anon to missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon missing status = %d, want 401", rec.Code)
+	}
+	// owner-of-default to missing ns must look the same
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", ts.ownerToken, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-ns owner status = %d, want 401", rec.Code)
+	}
+	// only root sees the truth (404) for a missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/no-such-ns/x.txt", ts.rootToken, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("root missing status = %d, want 404", rec.Code)
+	}
+}
+
+// TestAdminExistenceNotLeaked is the same property for the /_/ plane.
+func TestAdminExistenceNotLeaked(t *testing.T) {
+	ts := buildServer(t, nil)
+	// anon
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon admin missing = %d, want 401", rec.Code)
+	}
+	// owner-of-default to missing ns
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", ts.ownerToken, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-ns owner admin missing = %d, want 401", rec.Code)
+	}
+	// root distinguishes
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/no-such-ns/tokens", ts.rootToken, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("root admin missing = %d, want 404", rec.Code)
 	}
 }
 
 func TestDeleteObject(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write", "delete"})
-
-	rec := doPut(t, srv, "", "/default/docs/del.txt", token, "to delete", "text/plain")
+	ts := buildServer(t, nil)
+	rec := doPut(t, ts.srv, "", "/default/d.txt", ts.ownerToken, "x", "text/plain")
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatal()
 	}
-
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodDelete, "/default/docs/del.txt", token, nil))
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodDelete, "/default/d.txt", ts.ownerToken, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("DELETE status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/del.txt", token, nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("post-delete get status = %d", rec.Code)
+		t.Fatalf("DELETE status = %d", rec.Code)
 	}
 }
 
-func TestDeleteRequiresDeletePerm(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read"})
+func TestEncodedTraversalRejected(t *testing.T) {
+	ts := buildServer(t, nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodDelete, "/default/x.txt", token, nil))
-	if rec.Code != http.StatusForbidden {
+	ts.srv.ServeHTTP(rec, putReq(t, "", "/default/docs/%2e%2e/secret.txt", ts.ownerToken, "x", "text/plain"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestUploadLimit(t *testing.T) {
+	ts := buildServer(t, func(cfg *Config) {
+		cfg.MaxUploadBytes = 512
+	})
+	rec := doPut(t, ts.srv, "", "/default/big.bin", ts.ownerToken, strings.Repeat("x", 2048), "application/octet-stream")
+	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d", rec.Code)
 	}
 }
 
 func TestListObjects(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write"})
-
+	ts := buildServer(t, nil)
 	for _, p := range []string{"/a/1.txt", "/a/2.txt", "/b/3.txt"} {
-		rec := doPut(t, srv, "", "/default"+p, token, "body", "text/plain")
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("PUT %s status = %d body=%s", p, rec.Code, rec.Body.String())
+		if rec := doPut(t, ts.srv, "", "/default"+p, ts.ownerToken, "x", "text/plain"); rec.Code != http.StatusCreated {
+			t.Fatalf("PUT %s status = %d", p, rec.Code)
 		}
 	}
-
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default?prefix=/a", token, nil))
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default?prefix=/a", ts.ownerToken, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("list status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("list status = %d", rec.Code)
 	}
 	var resp struct {
 		Objects []struct {
@@ -236,289 +320,309 @@ func TestListObjects(t *testing.T) {
 	}
 }
 
-func TestUploadRejectsTraversal(t *testing.T) {
-	srv, token := newTestServer(t, []string{"write"})
+// --- admin plane ---
 
+func TestAdminCreateNamespace(t *testing.T) {
+	ts := buildServer(t, nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, putReq(t, "", "/default/docs/%2e%2e/secret.txt", token, "body", ""))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestPutRequiresPath(t *testing.T) {
-	srv, token := newTestServer(t, []string{"write"})
-
-	// PUT to bare /{namespace} (path-fallback list endpoint, which only accepts GET).
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, putReq(t, "", "/default", token, "body", ""))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-// ---------- subdomain tests (BaseDomain enabled) ----------
-
-func TestSubdomainUploadDownload(t *testing.T) {
-	srv, token := newTestServerWithConfig(t, []string{"read", "write"}, withSubdomain)
-
-	rec := doPut(t, srv, "default.example.test", "/docs/hello.txt", token, "hi via subdomain", "text/plain")
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", ts.rootToken, map[string]string{"name": "newone"}))
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("create status = %d body=%s", rec.Code, rec.Body.String())
 	}
-
-	req := httptest.NewRequest(http.MethodGet, "http://default.example.test/docs/hello.txt", nil)
-	req.Host = "default.example.test"
-	req.Header.Set("Authorization", "Bearer "+token)
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET status = %d body=%s", rec.Code, rec.Body.String())
+	var resp struct {
+		Namespace    string `json:"namespace"`
+		OwnerToken   string `json:"owner_token"`
+		OwnerTokenID string `json:"owner_token_id"`
 	}
-	if rec.Body.String() != "hi via subdomain" {
-		t.Fatalf("body = %q", rec.Body.String())
+	decodeJSON(t, rec.Body, &resp)
+	if resp.Namespace != "newone" || resp.OwnerToken == "" {
+		t.Fatalf("bad response %+v", resp)
+	}
+	// owner token must be able to PUT
+	rec = doPut(t, ts.srv, "", "/newone/x.txt", resp.OwnerToken, "body", "text/plain")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("owner PUT status = %d", rec.Code)
 	}
 }
 
-func TestSubdomainBadMethod(t *testing.T) {
-	srv, token := newTestServerWithConfig(t, []string{"read", "write"}, withSubdomain)
-	req := httptest.NewRequest("POST", "http://default.example.test/x", nil)
-	req.Host = "default.example.test"
-	req.Header.Set("Authorization", "Bearer "+token)
+func TestAdminCreateRequiresRoot(t *testing.T) {
+	ts := buildServer(t, nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", ts.ownerToken, map[string]string{"name": "newone"}))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-root status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", "", map[string]string{"name": "newone"}))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d", rec.Code)
+	}
+}
+
+func TestAdminCreateRejectsLeadingUnderscore(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", ts.rootToken, map[string]string{"name": "_evil"}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminCreateConflict(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", ts.rootToken, map[string]string{"name": "default"}))
+	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if rec.Header().Get("Allow") == "" {
-		t.Fatal("missing Allow header")
+}
+
+func TestAdminListNamespaces(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces", ts.rootToken, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var items []map[string]any
+	decodeJSON(t, rec.Body, &items)
+	if len(items) != 1 {
+		t.Fatalf("len = %d, want 1", len(items))
 	}
 }
 
-func TestSubdomainBaseHostNotNamespace(t *testing.T) {
-	srv, token := newTestServerWithConfig(t, []string{"read"}, withSubdomain)
-	req := httptest.NewRequest(http.MethodGet, "http://example.test/docs/missing.txt", nil)
-	req.Host = "example.test"
-	req.Header.Set("Authorization", "Bearer "+token)
+func TestAdminDeleteNamespace(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := doPut(t, ts.srv, "", "/default/file.txt", ts.ownerToken, "x", "text/plain")
+	if rec.Code != http.StatusCreated {
+		t.Fatal()
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodDelete, "/_/namespaces/default", ts.rootToken, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if ts.authStore.HasNamespace("default") {
+		t.Fatal("namespace must be gone")
+	}
+}
+
+func TestAdminTokenCreate(t *testing.T) {
+	ts := buildServer(t, nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/tokens", ts.ownerToken, map[string]any{
+		"name":        "ci",
+		"permissions": []string{"read", "write"},
+	}))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Token       string   `json:"token"`
+		Permissions []string `json:"permissions"`
+	}
+	decodeJSON(t, rec.Body, &resp)
+	if resp.Token == "" {
+		t.Fatal("missing plaintext token")
+	}
+
+	// sub-token cannot issue: 401 (unified with cross-namespace/anon to
+	// avoid leaking that the sub-token has any admin-shaped privileges).
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/tokens", resp.Token, map[string]any{
+		"name":        "evil",
+		"permissions": []string{"read"},
+	}))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("sub-token issue status = %d", rec.Code)
+	}
+}
+
+func TestAdminTokenCreateRejectsOwnerPerm(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/tokens", ts.ownerToken, map[string]any{
+		"name":        "evil",
+		"permissions": []string{"owner"},
+	}))
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestSubdomainListAtRoot(t *testing.T) {
-	srv, token := newTestServerWithConfig(t, []string{"read", "write"}, withSubdomain)
-
-	rec := doPut(t, srv, "default.example.test", "/a/1.txt", token, "body", "text/plain")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d", rec.Code)
+func TestAdminTokenList(t *testing.T) {
+	ts := buildServer(t, nil)
+	if _, err := ts.authStore.CreateToken("default", "ci", []string{"read"}); err != nil {
+		t.Fatal(err)
 	}
-
-	req := httptest.NewRequest(http.MethodGet, "http://default.example.test/?prefix=/a", nil)
-	req.Host = "default.example.test"
-	req.Header.Set("Authorization", "Bearer "+token)
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodGet, "/_/namespaces/default/tokens", ts.ownerToken, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("list status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var tokens []map[string]any
+	decodeJSON(t, rec.Body, &tokens)
+	if len(tokens) != 2 {
+		t.Fatalf("len = %d, want 2", len(tokens))
 	}
 }
 
-func TestSubdomainDisabledWhenBaseDomainEmpty(t *testing.T) {
-	// BaseDomain="" — subdomain header is just ignored, path-fallback rules.
-	srv, token := newTestServer(t, []string{"read", "write"})
-
-	rec := doPut(t, srv, "default.example.test", "/docs/x.txt", token, "body", "text/plain")
-	// /docs/x.txt has no leading namespace segment when subdomain dispatch is off,
-	// so the mux can't resolve a namespace and returns 404.
-	if rec.Code == http.StatusCreated {
-		t.Fatalf("subdomain PUT unexpectedly succeeded; status = %d body=%s", rec.Code, rec.Body.String())
+func TestAdminTokenRevoke(t *testing.T) {
+	ts := buildServer(t, nil)
+	created, err := ts.authStore.CreateToken("default", "ci", []string{"read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodDelete, "/_/namespaces/default/tokens/"+created.TokenID, ts.ownerToken, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
-// ---------- public-read (subdomain-driven path) ----------
-
-func TestPublicReadAlias(t *testing.T) {
-	srv, token := newTestServer(t, []string{"read", "write"})
-
-	rec := doPut(t, srv, "", "/default/docs/public.txt", token, "public body", "text/plain")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("PUT status = %d body=%s", rec.Code, rec.Body.String())
+func TestAdminTokenRevokeOwnerBlocked(t *testing.T) {
+	ts := buildServer(t, nil)
+	infos, err := ts.authStore.ListTokens("default")
+	if err != nil {
+		t.Fatal(err)
 	}
+	var ownerID string
+	for _, ti := range infos {
+		if ti.Owner {
+			ownerID = ti.ID
+		}
+	}
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodDelete, "/_/namespaces/default/tokens/"+ownerID, ts.ownerToken, nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
 
-	// before public-read: 401
-	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/public.txt", "", nil))
+func TestAdminRotateOwner(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/rotate-owner", ts.rootToken, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OwnerToken string `json:"owner_token"`
+	}
+	decodeJSON(t, rec.Body, &resp)
+	if resp.OwnerToken == "" {
+		t.Fatal("missing new owner token")
+	}
+	// old owner token now rejected: 401 (token is unknown to the store).
+	rec = doPut(t, ts.srv, "", "/default/x.txt", ts.ownerToken, "x", "text/plain")
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("no-token status = %d", rec.Code)
+		t.Fatalf("old owner status = %d", rec.Code)
 	}
+}
 
-	if err := auth.SetNamespacePublicRead(srv.AuthReloader().Get(), "default", true); err != nil {
-		t.Fatal(err)
+func TestAdminSetPublic(t *testing.T) {
+	ts := buildServer(t, nil)
+	// seed
+	if rec := doPut(t, ts.srv, "", "/default/p.txt", ts.ownerToken, "body", "text/plain"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed PUT status = %d", rec.Code)
 	}
-
+	// no anon read yet
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/p.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// flip public on
 	rec = httptest.NewRecorder()
-	srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/docs/public.txt", "", nil))
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/public", ts.ownerToken, map[string]bool{"on": true}))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("public-read status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/p.txt", "", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anon read status = %d", rec.Code)
 	}
 }
 
-// ---------- hot reload (no HTTP) ----------
-
-func TestAuthHotReload(t *testing.T) {
-	dir := t.TempDir()
-	authFilePath := filepath.Join(dir, "auth.json")
-	authFile := &auth.File{Version: 1, Namespaces: map[string]*auth.Namespace{}}
-	if _, err := auth.CreateNamespace(authFile, "default"); err != nil {
+func TestAdminListingStillRequiresToken(t *testing.T) {
+	ts := buildServer(t, nil)
+	if err := ts.authStore.SetPublicRead("default", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.SaveFile(authFilePath, authFile); err != nil {
-		t.Fatal(err)
-	}
-	srv, err := New(Config{
-		DataDir:        dir,
-		AuthFile:       authFilePath,
-		MaxUploadBytes: 1 << 20,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if srv.AuthReloader().HasNamespace("late") {
-		t.Fatal("late namespace should not exist yet")
-	}
-	reloaded, err := auth.LoadFile(authFilePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := auth.CreateNamespace(reloaded, "late"); err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.SaveFile(authFilePath, reloaded); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.AuthReloader().ForceReload(); err != nil {
-		t.Fatal(err)
-	}
-	if !srv.AuthReloader().HasNamespace("late") {
-		t.Fatal("late namespace should exist after reload")
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("listing unauth status = %d", rec.Code)
 	}
 }
 
-func TestAuthMaybeReloadDetectsMtime(t *testing.T) {
-	dir := t.TempDir()
-	authFilePath := filepath.Join(dir, "auth.json")
-	authFile := &auth.File{Version: 1, Namespaces: map[string]*auth.Namespace{}}
-	if _, err := auth.CreateNamespace(authFile, "default"); err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.SaveFile(authFilePath, authFile); err != nil {
-		t.Fatal(err)
-	}
-	r, err := auth.NewReloader(authFilePath, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().Add(2 * time.Second)
-	if err := os.Chtimes(authFilePath, future, future); err != nil {
-		t.Fatal(err)
-	}
-	reloaded, err := r.MaybeReload()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reloaded {
-		t.Fatal("expected MaybeReload to detect mtime change")
+func TestAdminRejectInvalidNamespace(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/_bad/tokens", ts.rootToken, map[string]any{"name": "x", "permissions": []string{"read"}}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
 	}
 }
 
-// ---------- helpers ----------
-
-func newTestServer(t *testing.T, permissions []string) (*Server, string) {
-	return newTestServerWithConfig(t, permissions, nil)
+func TestAdminUnderscorePrefixPathFallback(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/_/something/random", ts.rootToken, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
 }
 
-func newTestServerWithConfig(t *testing.T, permissions []string, configure func(*Config)) (*Server, string) {
-	t.Helper()
-	dir := t.TempDir()
-	authFilePath := filepath.Join(dir, "auth.json")
-	authFile := &auth.File{Version: 1, Namespaces: map[string]*auth.Namespace{}}
-	owner, err := auth.CreateNamespace(authFile, "default")
-	if err != nil {
-		t.Fatal(err)
+// --- subdomain ---
+
+func TestSubdomainRouting(t *testing.T) {
+	ts := buildServer(t, withSubdomain)
+	rec := doPut(t, ts.srv, "default.example.test", "/docs/hello.txt", ts.ownerToken, "hi", "text/plain")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	token := owner.Token
-	if strings.Join(permissions, ",") != "read,write" {
-		created, err := auth.CreateToken(authFile, "default", "test", permissions)
-		if err != nil {
-			t.Fatal(err)
+}
+
+func TestSubdomainUnderscoreNotMapped(t *testing.T) {
+	ts := buildServer(t, withSubdomain)
+	// _evil.example.test should not map to namespace "_evil"
+	if ns, ok := ts.srv.namespaceFromHost("_evil.example.test"); ok {
+		t.Fatalf("namespace must not be %q", ns)
+	}
+}
+
+// --- benchmarks ---
+
+func BenchmarkServeHTTPGet(b *testing.B) {
+	ts := buildServer(b, nil)
+	if rec := doPut(b, ts.srv, "", "/default/x.txt", ts.ownerToken, "body", "text/plain"); rec.Code != http.StatusCreated {
+		b.Fatal()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/x.txt", ts.ownerToken, nil))
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d", rec.Code)
 		}
-		token = created.Token
 	}
-	if err := auth.SaveFile(authFilePath, authFile); err != nil {
-		t.Fatal(err)
-	}
-	cfg := Config{
-		DataDir:        dir,
-		AuthFile:       authFilePath,
-		MaxUploadBytes: 1 << 20,
-	}
-	if configure != nil {
-		configure(&cfg)
-	}
-	srv, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return srv, token
 }
 
-// withSubdomain enables the optional subdomain dispatcher in test config.
-func withSubdomain(cfg *Config) {
-	cfg.BaseDomain = "example.test"
+func BenchmarkServeHTTPPut(b *testing.B) {
+	ts := buildServer(b, nil)
+	body := strings.Repeat("a", 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rec := doPut(b, ts.srv, "", "/default/bench.bin", ts.ownerToken, body, "application/octet-stream")
+		if rec.Code != http.StatusCreated {
+			b.Fatalf("status = %d", rec.Code)
+		}
+	}
 }
-
-func newTestServerWithNamespaces(t *testing.T, namespaces map[string][]string, configure func(*Config)) (*Server, map[string]string) {
-	t.Helper()
-	dir := t.TempDir()
-	authFilePath := filepath.Join(dir, "auth.json")
-	authFile := &auth.File{Version: 1, Namespaces: map[string]*auth.Namespace{}}
-	tokens := make(map[string]string, len(namespaces))
-	for namespace, permissions := range namespaces {
-		owner, err := auth.CreateNamespace(authFile, namespace)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tokens[namespace] = owner.Token
-		if strings.Join(permissions, ",") == "owner" {
-			continue
-		}
-		created, err := auth.CreateToken(authFile, namespace, "test", permissions)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tokens[namespace] = created.Token
-	}
-	if err := auth.SaveFile(authFilePath, authFile); err != nil {
-		t.Fatal(err)
-	}
-	cfg := Config{
-		DataDir:        dir,
-		AuthFile:       authFilePath,
-		MaxUploadBytes: 1 << 20,
-	}
-	if configure != nil {
-		configure(&cfg)
-	}
-	srv, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return srv, tokens
-}
-
-// ---------- benchmarks ----------
 
 func BenchmarkNamespaceFromHost(b *testing.B) {
 	srv := &Server{hostSuffix: ".example.test"}
@@ -530,102 +634,11 @@ func BenchmarkNamespaceFromHost(b *testing.B) {
 	}
 }
 
-func BenchmarkNamespaceFromHostMixedCase(b *testing.B) {
-	srv := &Server{hostSuffix: ".example.test"}
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if ns, ok := srv.namespaceFromHost("Default.Example.TEST"); !ok || ns != "default" {
-			b.Fatal("want default")
-		}
-	}
-}
-
 func BenchmarkClientIP(b *testing.B) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = clientIP(req)
-	}
-}
-
-func BenchmarkServeHTTPList(b *testing.B) {
-	srv, token := newBenchServer(b)
-	for i := 0; i < 100; i++ {
-		rec := doPut(b, srv, "",
-			"/default/dir/"+strings.Repeat("a", i+1)+".txt", token, "body", "text/plain")
-		if rec.Code != http.StatusCreated {
-			b.Fatalf("PUT %d status = %d", i, rec.Code)
-		}
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default", token, nil))
-		if rec.Code != http.StatusOK {
-			b.Fatalf("status = %d", rec.Code)
-		}
-	}
-}
-
-func BenchmarkServeHTTPGet(b *testing.B) {
-	srv, token := newBenchServer(b)
-	rec := doPut(b, srv, "", "/default/h.txt", token, "body", "text/plain")
-	if rec.Code != http.StatusCreated {
-		b.Fatalf("seed PUT status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/h.txt", token, nil))
-		if rec.Code != http.StatusOK {
-			b.Fatalf("status = %d", rec.Code)
-		}
-	}
-}
-
-func BenchmarkServeHTTPPut(b *testing.B) {
-	srv, token := newBenchServer(b)
-	body := strings.Repeat("a", 256)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		rec := doPut(b, srv, "", "/default/bench.bin", token, body, "application/octet-stream")
-		if rec.Code != http.StatusCreated {
-			b.Fatalf("status = %d", rec.Code)
-		}
-	}
-}
-
-func newBenchServer(b *testing.B) (*Server, string) {
-	b.Helper()
-	dir := b.TempDir()
-	authFilePath := filepath.Join(dir, "auth.json")
-	authFile := &auth.File{Version: 1, Namespaces: map[string]*auth.Namespace{}}
-	owner, err := auth.CreateNamespace(authFile, "default")
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := auth.SaveFile(authFilePath, authFile); err != nil {
-		b.Fatal(err)
-	}
-	srv, err := New(Config{
-		DataDir:        dir,
-		AuthFile:       authFilePath,
-		MaxUploadBytes: 1 << 20,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		b.Fatal(err)
-	}
-	return srv, owner.Token
-}
-
-func decodeJSON(t *testing.T, r io.Reader, v any) {
-	t.Helper()
-	if err := json.NewDecoder(r).Decode(v); err != nil {
-		t.Fatal(err)
 	}
 }

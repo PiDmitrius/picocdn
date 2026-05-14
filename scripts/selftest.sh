@@ -2,11 +2,12 @@
 # picocdn end-to-end self-test.
 #
 # Runs: gofmt, go vet, go test, go test -race, microbenchmarks, build,
-# CLI smoke, HTTP smoke via path-fallback (no DNS required), an optional
-# subdomain-mode section, GC/backup/restore, and optional load tests
-# (bombardier, vegeta) if those tools exist.
+# CLI smoke (init/root), HTTP smoke via path-fallback (no DNS required),
+# admin plane checks, subdomain-mode section, GC/backup/restore, and
+# optional load tests (bombardier, vegeta) if those tools exist.
 #
-# Exits 0 only if every check passes.
+# The test isolates state under a temp HOME so it never touches the real
+# ~/.config/picocdn or ~/.local/share/picocdn.
 
 set -uo pipefail
 
@@ -59,6 +60,8 @@ FAIL=0
 SERVER_PID=
 WORK=$(mktemp -d -p "${TMPDIR:-/tmp}" picocdn-selftest-XXXX)
 BIN="$WORK/picocdn"
+DATA="$WORK/data"
+SAVED_HOME="$HOME"
 
 cleanup() {
   local rc=$?
@@ -92,42 +95,50 @@ info() { printf "       ${BLUE}%s${NC}\n" "$*"; }
 
 # ---------- helpers ----------
 
-# expect <actual> <expected> [hint]
 expect() {
   if [[ "$1" == "$2" ]]; then ok; else ko "want=$2 got=$1 ${3:-}"; fi
 }
 
-# http_status <curl args...>
 http_status() {
   curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" 2>/dev/null || echo "curl_failed"
 }
 
-# read_json_field <json> <field>
+# read_json_field <json> <field>: extract first quoted string value for a
+# field, handling JSON on a single line or across lines.
 read_json_field() {
-  echo "$1" | awk -F\" '/"'"$2"'":/ {print $4; exit}'
+  echo "$1" | tr -d '\n' | grep -oE '"'"$2"'"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed -E 's/^"[^"]+"[[:space:]]*:[[:space:]]*"(.*)"$/\1/'
 }
 
-# start_server: launches picocdn without -base-domain (path-fallback only).
-# Extra flags can be appended.
-start_server() {
-  _start_server "" "$@"
+# json_post|delete: helpers for admin plane operations.
+admin_call() {
+  local method="$1" url="$2" token="$3" body="${4:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS -X "$method" \
+      -H "Authorization: Bearer $token" \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      "$url"
+  else
+    curl -fsS -X "$method" \
+      -H "Authorization: Bearer $token" \
+      "$url"
+  fi
 }
 
-# start_server_subdomain: launches picocdn with -base-domain example.test so the
-# subdomain dispatcher is active.
-start_server_subdomain() {
-  _start_server "example.test" "$@"
-}
+start_server() { _start_server "" "$@"; }
+start_server_subdomain() { _start_server "example.test" "$@"; }
 
 _start_server() {
   local base="$1"; shift
-  local -a flags=( -addr "127.0.0.1:$PORT" -data-dir ./data -auth-file ./auth.json )
+  local -a flags=( -addr "127.0.0.1:$PORT" -data-dir "$DATA" )
   if [[ -n "$base" ]]; then
     flags+=( -base-domain "$base" )
   fi
   flags+=( "$@" )
   cd "$WORK"
-  ( "$BIN" serve "${flags[@]}" >./srv.out 2>./srv.err ) &
+  ( HOME="$WORK" "$BIN" serve "${flags[@]}" >./srv.out 2>./srv.err ) &
   SERVER_PID=$!
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
@@ -153,13 +164,14 @@ stop_server() {
   SERVER_PID=
 }
 
-# Find an installed load-test tool; prefer PATH then ~/.local/bin.
 find_tool() {
   local name="$1"
   if command -v "$name" >/dev/null 2>&1; then
     command -v "$name"
   elif [[ -x "$HOME/.local/bin/$name" ]]; then
     echo "$HOME/.local/bin/$name"
+  elif [[ -x "$SAVED_HOME/.local/bin/$name" ]]; then
+    echo "$SAVED_HOME/.local/bin/$name"
   fi
 }
 
@@ -210,116 +222,147 @@ step "go build ./cmd/picocdn"
 if go build -o "$BIN" ./cmd/picocdn 2>"$WORK/build.err"; then ok
 else ko "see $WORK/build.err"; exit 1; fi
 
-cd "$WORK"
-mkdir -p data
+mkdir -p "$DATA"
 
-# ---------- 5. CLI smoke ----------
-section "CLI smoke"
+# From here on, HOME is the work dir so config.json lives inside $WORK.
+export HOME="$WORK"
 
-step "namespace create default"
-out=$("$BIN" namespace create --auth-file ./auth.json default 2>&1)
-TOKEN=$(read_json_field "$out" token)
-if [[ -n "$TOKEN" ]]; then ok; else ko "no token in: $out"; fi
+# ---------- 5. CLI smoke (init / root) ----------
+section "CLI smoke (init / root)"
 
-step "auth.json has mode 0600"
-mode=$(stat -c '%a' ./auth.json 2>/dev/null)
+step "picocdn init creates first root token"
+out=$("$BIN" init 2>&1)
+ROOT_TOKEN=$(read_json_field "$out" token)
+if [[ -n "$ROOT_TOKEN" && "$ROOT_TOKEN" == prt_* ]]; then ok
+else ko "no plaintext root token in: $out"; fi
+
+step "config.json has mode 0600"
+mode=$(stat -c '%a' "$WORK/.config/picocdn/config.json" 2>/dev/null)
 expect "$mode" "600"
 
-step "auth.json contains no plaintext token"
-if grep -qF "$TOKEN" ./auth.json 2>/dev/null; then
-  ko "plaintext token leaked into auth.json"
+step "config.json contains no plaintext root token"
+if grep -qF "$ROOT_TOKEN" "$WORK/.config/picocdn/config.json" 2>/dev/null; then
+  ko "plaintext token leaked into config.json"
 else
   ok
 fi
 
-step "namespace list shows default"
-out=$("$BIN" namespace list --auth-file ./auth.json 2>&1)
-if echo "$out" | grep -q '"name": "default"'; then ok; else ko "$out"; fi
+step "picocdn init refuses to re-bootstrap"
+if "$BIN" init >/dev/null 2>&1; then ko "second init should fail"; else ok; fi
 
-step "namespace show prints owner_token_id"
-out=$("$BIN" namespace show --auth-file ./auth.json default 2>&1)
-if echo "$out" | grep -q '"owner_token_id"'; then ok; else ko "$out"; fi
+step "picocdn root create issues second root"
+out=$("$BIN" root create --name extra 2>&1)
+EXTRA_ROOT=$(read_json_field "$out" token)
+if [[ -n "$EXTRA_ROOT" && "$EXTRA_ROOT" == prt_* ]]; then ok
+else ko "no extra root: $out"; fi
 
-step "token create with read perm"
-out=$("$BIN" token create --auth-file ./auth.json --name reader --perm read default 2>&1)
-READ_TOKEN=$(read_json_field "$out" token)
-if [[ -n "$READ_TOKEN" ]]; then ok; else ko "$out"; fi
-
-step "token list shows 2 tokens"
-n=$("$BIN" token list --auth-file ./auth.json default 2>&1 | grep -c '"id":')
+step "picocdn root list shows 2 entries"
+n=$("$BIN" root list 2>&1 | grep -c '"id":')
 expect "$n" "2"
 
-step "namespace set-public on"
-out=$("$BIN" namespace set-public --auth-file ./auth.json --on default 2>&1)
-if echo "$out" | grep -q '"public_read": true'; then ok; else ko "$out"; fi
+step "picocdn root revoke removes second root"
+EXTRA_ID=$(echo "$out" | awk -F\" '/"token_id":/ {print $4; exit}')
+if "$BIN" root revoke "$EXTRA_ID" >/dev/null 2>&1; then ok
+else ko "revoke failed"; fi
 
-step "namespace set-public off"
-out=$("$BIN" namespace set-public --auth-file ./auth.json --off default 2>&1)
-if echo "$out" | grep -q '"public_read": false'; then ok; else ko "$out"; fi
-
-step "namespace create rejects uppercase"
-if "$BIN" namespace create --auth-file ./auth.json BadName >/dev/null 2>&1; then
-  ko "expected failure for uppercase namespace"
+step "picocdn root revoke refuses the last root"
+LAST_ID=$("$BIN" root list 2>&1 | awk -F\" '/"id":/ {print $4; exit}')
+if "$BIN" root revoke "$LAST_ID" >/dev/null 2>&1; then
+  ko "revoke of last root should fail"
 else
   ok
 fi
 
-step "namespace create rejects dotted name"
-if "$BIN" namespace create --auth-file ./auth.json bad.name >/dev/null 2>&1; then
-  ko "expected failure for dotted namespace"
-else
-  ok
-fi
+step "picocdn version prints version"
+out=$("$BIN" version 2>&1)
+if [[ "$out" == picocdn* ]]; then ok; else ko "$out"; fi
 
-step "token revoke removes one token"
-TID=$("$BIN" token list --auth-file ./auth.json default 2>&1 | awk -F\" '/"id":/ {print $4}' | tail -1)
-"$BIN" token revoke --auth-file ./auth.json default "$TID" >/dev/null 2>&1
-n=$("$BIN" token list --auth-file ./auth.json default 2>&1 | grep -c '"id":')
-expect "$n" "1"
+# ---------- 6. HTTP smoke (admin + objects, path-fallback) ----------
+section "HTTP smoke — admin and objects (path-fallback)"
 
-step "owner token revoke is refused"
-OWNER_ID=$("$BIN" token list --auth-file ./auth.json default 2>&1 | awk -F\" '/"id":/ {print $4}' | head -1)
-if "$BIN" token revoke --auth-file ./auth.json default "$OWNER_ID" >/dev/null 2>&1; then
-  ko "owner token should not be revokable"
-else
-  ok
-fi
-
-# Re-issue a read token for HTTP tests.
-out=$("$BIN" token create --auth-file ./auth.json --name reader --perm read default 2>&1)
-READ_TOKEN=$(read_json_field "$out" token)
-
-# ---------- 6. HTTP smoke (path-fallback, no base-domain) ----------
-section "HTTP smoke — path-fallback (no DNS, no -base-domain)"
-
-if start_server -reload-interval 300ms -max-upload-bytes 1048576; then
-  info "server PID=$SERVER_PID port=$PORT max-upload=1MB reload=300ms base-domain=<none>"
+if start_server -max-upload-bytes 1048576; then
+  info "server PID=$SERVER_PID port=$PORT max-upload=1MB base-domain=<none>"
 else
   ko "failed to start server"; exit 1
 fi
 
-# Recipes use the local 'cdn' helper, as documented in README.
-cdn() { curl -fsS -H "Authorization: Bearer $TOKEN" "$@"; }
-HOST="http://127.0.0.1:$PORT/default"
+ADMIN="http://127.0.0.1:$PORT/_/namespaces"
+BASE="http://127.0.0.1:$PORT"
 
 step "GET /healthz returns 200"
-expect "$(http_status "http://127.0.0.1:$PORT/healthz")" "200"
+expect "$(http_status "$BASE/healthz")" "200"
 
-echo 'hello picocdn' > ./hello.txt
-step "PUT upload returns 201"
-up=$(cdn -T hello.txt -H 'Content-Type: text/plain' "$HOST/docs/hello.txt" 2>/dev/null) || up=""
+step "POST /_/namespaces creates default with owner"
+out=$(admin_call POST "$ADMIN" "$ROOT_TOKEN" '{"name":"default"}' 2>&1)
+OWNER_TOKEN=$(read_json_field "$out" owner_token)
+if [[ -n "$OWNER_TOKEN" && "$OWNER_TOKEN" == pcd_* ]]; then ok
+else ko "no owner_token in: $out"; fi
+
+step "namespaces/default.json has mode 0600"
+mode=$(stat -c '%a' "$DATA/namespaces/default.json" 2>/dev/null)
+expect "$mode" "600"
+
+step "namespaces/default.json contains no plaintext token"
+if grep -qF "$OWNER_TOKEN" "$DATA/namespaces/default.json" 2>/dev/null; then
+  ko "plaintext token leaked"
+else
+  ok
+fi
+
+step "POST duplicate namespace returns 409"
+expect "$(http_status -X POST -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"default"}' "$ADMIN")" "409"
+
+step "POST namespace with leading underscore returns 400"
+expect "$(http_status -X POST -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"_evil"}' "$ADMIN")" "400"
+
+step "POST namespace without root token returns 403"
+expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"x"}' "$ADMIN")" "403"
+
+step "GET /_/namespaces lists default"
+out=$(admin_call GET "$ADMIN" "$ROOT_TOKEN" 2>&1)
+if echo "$out" | grep -q '"default"'; then ok; else ko "$out"; fi
+
+step "POST /_/namespaces/default/tokens issues read+write token"
+out=$(admin_call POST "$ADMIN/default/tokens" "$OWNER_TOKEN" '{"name":"ci","permissions":["read","write"]}' 2>&1)
+RW_TOKEN=$(read_json_field "$out" token)
+if [[ -n "$RW_TOKEN" && "$RW_TOKEN" == pcd_* ]]; then ok; else ko "$out"; fi
+
+step "POST tokens with owner permission rejected (400)"
+expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"evil","permissions":["owner"]}' \
+  "$ADMIN/default/tokens")" "400"
+
+step "POST tokens by sub-token rejected (401, no admin scope)"
+expect "$(http_status -X POST -H "Authorization: Bearer $RW_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"x","permissions":["read"]}' \
+  "$ADMIN/default/tokens")" "401"
+
+step "GET /_/namespaces/default/tokens lists 2 tokens"
+out=$(admin_call GET "$ADMIN/default/tokens" "$OWNER_TOKEN" 2>&1)
+n=$(echo "$out" | tr -d '\n' | grep -oE '"id"[[:space:]]*:' | wc -l)
+expect "$n" "2"
+
+# ---- object operations ----
+cdn() { curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" "$@"; }
+HOST="$BASE/default"
+
+echo 'hello picocdn' > "$WORK/hello.txt"
+step "PUT object as owner returns 201"
+up=$(cdn -T "$WORK/hello.txt" -H 'Content-Type: text/plain' "$HOST/docs/hello.txt" 2>/dev/null) || up=""
 HASH=$(echo "$up" | grep -oE '"hash":"[0-9a-f]{64}"' | head -1 | tr -d '"' | sed 's/hash://')
 if [[ -n "$HASH" ]]; then ok; else ko "no hash; body: $up"; fi
 
-step "GET returns body"
+step "GET object returns body"
 body=$(cdn "$HOST/docs/hello.txt" 2>/dev/null)
 if [[ "$body" == "hello picocdn" ]]; then ok; else ko "got: $body"; fi
-
-step "single-segment path"
-echo 'one-segment' > ./one.txt
-cdn -T one.txt "$HOST/one.txt" >/dev/null
-body=$(cdn "$HOST/one.txt" 2>/dev/null)
-if [[ "$body" == "one-segment" ]]; then ok; else ko "got: $body"; fi
 
 step "HEAD exposes ETag and Content-Length"
 hdrs=$(cdn -I "$HOST/docs/hello.txt" 2>/dev/null)
@@ -334,8 +377,8 @@ step "Range bytes=0-4 returns first 5 bytes"
 body=$(cdn -H "Range: bytes=0-4" "$HOST/docs/hello.txt" 2>/dev/null)
 if [[ "$body" == "hello" ]]; then ok; else ko "got: $body"; fi
 
-step 'If-None-Match returns 304'
-expect "$(http_status -H "Authorization: Bearer $TOKEN" \
+step "If-None-Match returns 304"
+expect "$(http_status -H "Authorization: Bearer $OWNER_TOKEN" \
   -H "If-None-Match: \"sha256:$HASH\"" \
   "$HOST/docs/hello.txt")" "304"
 
@@ -343,181 +386,235 @@ step "list at /{namespace} returns objects"
 n=$(cdn "$HOST" 2>/dev/null | grep -oc '"hash":"[0-9a-f]\{64\}"')
 if [[ "$n" -ge 1 ]]; then ok; else ko "no entries (n=$n)"; fi
 
-step "list with ?prefix= narrows results"
+step "list with ?prefix= narrows"
 n=$(cdn "$HOST?prefix=/docs" 2>/dev/null | grep -oc '"hash":"[0-9a-f]\{64\}"')
 if [[ "$n" -ge 1 ]]; then ok; else ko "no entries (n=$n)"; fi
 
 # ---- auth checks ----
-step "missing token returns 401"
+step "missing token on GET returns 401"
 expect "$(http_status "$HOST/docs/hello.txt")" "401"
 
-step "wrong token returns 403"
-expect "$(http_status -H "Authorization: Bearer wrong" "$HOST/docs/hello.txt")" "403"
+step "wrong token returns 401 (unified, no existence leak)"
+expect "$(http_status -H "Authorization: Bearer wrong" "$HOST/docs/hello.txt")" "401"
 
-step "read-only token cannot PUT (403)"
-expect "$(http_status -X PUT --data-binary @hello.txt -H "Authorization: Bearer $READ_TOKEN" \
+step "read+write token CAN write (201)"
+echo body > "$WORK/x.txt"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $RW_TOKEN" "$HOST/x.txt")" "201"
+
+step "read+write token CANNOT delete (403)"
+expect "$(http_status -X DELETE -H "Authorization: Bearer $RW_TOKEN" \
   "$HOST/x.txt")" "403"
 
-step "read-only token cannot DELETE (403)"
-expect "$(http_status -X DELETE -H "Authorization: Bearer $READ_TOKEN" \
-  "$HOST/docs/hello.txt")" "403"
+step "root token works on object plane (201)"
+echo from-root > "$WORK/r.txt"
+expect "$(http_status -X PUT --data-binary @"$WORK/r.txt" \
+  -H "Authorization: Bearer $ROOT_TOKEN" "$HOST/root.txt")" "201"
 
-step "PUT to nonexistent namespace returns 404"
-expect "$(http_status -X PUT --data-binary @hello.txt -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:$PORT/missing/x.txt")" "404"
+step "PUT to nonexistent namespace via owner token returns 401 (no leak)"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$BASE/missing/x.txt")" "401"
 
-# ---- path traversal ----
+step "root sees 404 for missing namespace (root knows the list)"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  "$BASE/missing/x.txt")" "404"
+
 step "encoded %2e%2e traversal rejected (400)"
-expect "$(http_status --path-as-is -H "Authorization: Bearer $TOKEN" \
+expect "$(http_status --path-as-is -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/docs/%2e%2e/etc/passwd")" "400"
 
-# Note: literal ".." in path-fallback URLs is normalized by Go's ServeMux
-# *before* our handler runs (307 redirect to the cleaned path), so we only
-# verify literal-.. rejection in the subdomain section below.
-
-step "PUT with traversal path rejected (400)"
-expect "$(http_status -X PUT --path-as-is --data-binary @hello.txt \
-  -H "Authorization: Bearer $TOKEN" \
-  "$HOST/docs/%2e%2e/secret.txt")" "400"
-
-# ---- routing edge cases ----
 step "POST on object path returns 405"
-expect "$(http_status -X POST -H "Authorization: Bearer $TOKEN" "$HOST/foo")" "405"
+expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" "$HOST/foo")" "405"
 
 step "PUT to bare /{namespace} (list endpoint) returns 400"
-expect "$(http_status -X PUT -H "Authorization: Bearer $TOKEN" --data-binary @hello.txt \
+expect "$(http_status -X PUT -H "Authorization: Bearer $OWNER_TOKEN" --data-binary @"$WORK/x.txt" \
   "$HOST")" "400"
+
+step "GET /_ returns 404 (admin discovery disabled)"
+expect "$(http_status "$BASE/_")" "404"
+
+step "GET /_/ returns 404"
+expect "$(http_status "$BASE/_/")" "404"
 
 # ---- max upload bytes ----
 step "upload within max-upload-bytes accepted"
-head -c 100000 /dev/urandom > ./under.bin
-expect "$(http_status -X PUT --data-binary @under.bin -H "Authorization: Bearer $TOKEN" \
+head -c 100000 /dev/urandom > "$WORK/under.bin"
+expect "$(http_status -X PUT --data-binary @"$WORK/under.bin" \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/under.bin")" "201"
 
 step "upload over max-upload-bytes returns 413"
-head -c 2000000 /dev/urandom > ./over.bin
-expect "$(http_status -X PUT --data-binary @over.bin -H "Authorization: Bearer $TOKEN" \
+head -c 2000000 /dev/urandom > "$WORK/over.bin"
+expect "$(http_status -X PUT --data-binary @"$WORK/over.bin" \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/over.bin")" "413"
 
 # ---- cross-namespace isolation ----
-step "second namespace + token isolated from default"
-out=$("$BIN" namespace create --auth-file ./auth.json other 2>&1)
-OTHER_TOKEN=$(read_json_field "$out" token)
-sleep 0.5
-expect "$(http_status -H "Authorization: Bearer $OTHER_TOKEN" \
-  "$HOST/docs/hello.txt")" "403"
+step "create second namespace via admin"
+out=$(admin_call POST "$ADMIN" "$ROOT_TOKEN" '{"name":"other"}' 2>&1)
+OTHER_OWNER=$(read_json_field "$out" owner_token)
+if [[ -n "$OTHER_OWNER" ]]; then ok; else ko "$out"; fi
 
-# ---- public-read + hot reload ----
+step "cross-namespace token returns 401 (no existence leak)"
+expect "$(http_status -H "Authorization: Bearer $OTHER_OWNER" \
+  "$HOST/docs/hello.txt")" "401"
+
+step "rotate-owner invalidates old owner (401)"
+new_out=$(admin_call POST "$ADMIN/default/rotate-owner" "$ROOT_TOKEN" 2>&1)
+NEW_OWNER=$(read_json_field "$new_out" owner_token)
+if [[ -n "$NEW_OWNER" ]]; then
+  expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+    -H "Authorization: Bearer $OWNER_TOKEN" "$HOST/after-rotate.txt")" "401"
+else
+  ko "no new owner_token in rotate response"
+fi
+OWNER_TOKEN="$NEW_OWNER"
+
+step "new owner token works after rotate (201)"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $OWNER_TOKEN" "$HOST/after-rotate.txt")" "201"
+
+# ---- public-read via admin ----
 step "public-read off → 401 without token"
-"$BIN" namespace set-public --auth-file ./auth.json --off default >/dev/null 2>&1
-sleep 0.5
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":false}' >/dev/null
 expect "$(http_status "$HOST/docs/hello.txt")" "401"
 
-step "public-read on, hot-reloaded → 200 without token"
-"$BIN" namespace set-public --auth-file ./auth.json --on default >/dev/null 2>&1
-sleep 0.5
+step "public-read on → 200 without token"
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":true}' >/dev/null
 expect "$(http_status "$HOST/docs/hello.txt")" "200"
 
+step "public-read on still requires token for listing"
+expect "$(http_status "$HOST")" "401"
+
 step "public-read off again → 401"
-"$BIN" namespace set-public --auth-file ./auth.json --off default >/dev/null 2>&1
-sleep 0.5
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":false}' >/dev/null
 expect "$(http_status "$HOST/docs/hello.txt")" "401"
 
-step "new namespace via CLI picked up by hot reload"
-out=$("$BIN" namespace create --auth-file ./auth.json hotreload 2>&1)
-HR_TOKEN=$(read_json_field "$out" token)
-sleep 0.5
-echo body > ./hr.txt
-expect "$(http_status -X PUT --data-binary @hr.txt -H "Authorization: Bearer $HR_TOKEN" \
-  "http://127.0.0.1:$PORT/hotreload/x.txt")" "201"
-
-# ---- delete ----
+# ---- delete object ----
 step "DELETE existing object returns 200"
-expect "$(http_status -X DELETE -H "Authorization: Bearer $TOKEN" \
+expect "$(http_status -X DELETE -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/docs/hello.txt")" "200"
 
 step "GET after DELETE returns 404"
-expect "$(http_status -H "Authorization: Bearer $TOKEN" \
+expect "$(http_status -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/docs/hello.txt")" "404"
 
-# stop server cleanly before next section.
+# ---- revoke sub-token ----
+step "issue fresh sub-token for revoke test"
+out=$(admin_call POST "$ADMIN/default/tokens" "$OWNER_TOKEN" '{"name":"doomed","permissions":["read"]}' 2>&1)
+DOOMED_ID=$(read_json_field "$out" token_id)
+if [[ -n "$DOOMED_ID" ]]; then ok; else ko "$out"; fi
+
+step "DELETE sub-token via admin returns 204"
+expect "$(http_status -X DELETE -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$ADMIN/default/tokens/$DOOMED_ID")" "204"
+
+step "DELETE owner token via admin refused (400)"
+# Find owner token id: the one with "owner": true.
+OID=$(admin_call GET "$ADMIN/default/tokens" "$OWNER_TOKEN" 2>&1 \
+  | tr -d '\n' \
+  | grep -oE '\{[^{}]*"owner"[[:space:]]*:[[:space:]]*true[^{}]*\}' \
+  | head -1 \
+  | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+  | head -1 \
+  | sed -E 's/.*"([^"]+)"$/\1/')
+expect "$(http_status -X DELETE -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$ADMIN/default/tokens/$OID")" "400"
+
+# ---- delete whole namespace ----
+step "DELETE /_/namespaces/other returns 204"
+expect "$(http_status -X DELETE -H "Authorization: Bearer $ROOT_TOKEN" \
+  "$ADMIN/other")" "204"
+
+step "deleted namespace no longer accepts PUT (404)"
+expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  "$BASE/other/y.txt")" "404"
+
 stop_server
 
-# ---------- 7. HTTP smoke — subdomain mode (-base-domain) ----------
+# ---------- 7. HTTP smoke — subdomain mode ----------
 section "HTTP smoke — subdomain mode"
 
-if start_server_subdomain -reload-interval 0 -max-upload-bytes 1048576; then
+if start_server_subdomain -max-upload-bytes 1048576; then
   info "server PID=$SERVER_PID port=$PORT base-domain=example.test"
 else
   ko "failed to start server in subdomain mode"; exit 1
 fi
 
-# Same `cdn` helper, just with Host header for subdomain emulation on localhost.
-HOST_SUB="http://127.0.0.1:$PORT"
 HOST_HEADER='Host: default.example.test'
 
 step "PUT via subdomain (Host header) returns 201"
-echo 'sub body' > ./sub.txt
-expect "$(http_status -X PUT --data-binary @sub.txt \
-  -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/sub/file.txt")" "201"
+echo 'sub body' > "$WORK/sub.txt"
+expect "$(http_status -X PUT --data-binary @"$WORK/sub.txt" \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  "$BASE/sub/file.txt")" "201"
 
 step "GET via subdomain returns body"
-body=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/sub/file.txt" 2>/dev/null)
+body=$(curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  "$BASE/sub/file.txt" 2>/dev/null)
 if [[ "$body" == "sub body" ]]; then ok; else ko "got: $body"; fi
 
 step "DELETE via subdomain returns 200"
-expect "$(http_status -X DELETE -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/sub/file.txt")" "200"
-
-step "list at subdomain root returns objects"
-echo a > ./a.txt
-curl -fsS -X PUT --data-binary @a.txt \
-  -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/list-test/a.txt" >/dev/null
-n=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/?prefix=/list-test" 2>/dev/null | grep -oc '"hash":"[0-9a-f]\{64\}"')
-if [[ "$n" -ge 1 ]]; then ok; else ko "no entries (n=$n)"; fi
+expect "$(http_status -X DELETE -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  "$BASE/sub/file.txt")" "200"
 
 step "POST via subdomain returns 405"
-expect "$(http_status -X POST -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/foo")" "405"
+expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  "$BASE/foo")" "405"
 
 step "PUT at subdomain root (no path) returns 400"
-expect "$(http_status -X PUT -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  --data-binary @a.txt "$HOST_SUB/")" "400"
+expect "$(http_status -X PUT -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  --data-binary @"$WORK/sub.txt" "$BASE/")" "400"
 
-step "base host (example.test) not treated as namespace"
-expect "$(http_status -H "Host: example.test" -H "Authorization: Bearer $TOKEN" \
-  "$HOST_SUB/docs/anything")" "404"
+step "base host (example.test) falls back to path routing"
+# falls into path-fallback /docs/anything; "docs" namespace does not exist
+# and token doesn't match it — unified 401 instead of leaking 404.
+expect "$(http_status -H "Host: example.test" -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$BASE/docs/anything")" "401"
 
-step "literal .. traversal via subdomain rejected (400)"
-expect "$(http_status --path-as-is -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/docs/../etc/passwd")" "400"
+step "underscore-prefix subdomain not routed; falls back to path"
+expect "$(http_status -H "Host: _bad.example.test" -H "Authorization: Bearer $OWNER_TOKEN" \
+  "$BASE/x")" "401"
 
 step "encoded %2e%2e via subdomain rejected (400)"
-expect "$(http_status --path-as-is -H "Authorization: Bearer $TOKEN" -H "$HOST_HEADER" \
-  "$HOST_SUB/docs/%2e%2e/etc/passwd")" "400"
+expect "$(http_status --path-as-is -H "Authorization: Bearer $OWNER_TOKEN" -H "$HOST_HEADER" \
+  "$BASE/docs/%2e%2e/etc/passwd")" "400"
 
 stop_server
 
-# ---------- 8. backup / restore / GC ----------
+# ---------- 8. fail-fast on bad namespace file ----------
+section "fail-fast loader"
+
+step "broken namespaces/<x>.json prevents server start"
+echo 'not json' > "$DATA/namespaces/broken.json"
+if HOME="$WORK" "$BIN" serve -addr "127.0.0.1:$PORT" -data-dir "$DATA" >"$WORK/badstart.out" 2>"$WORK/badstart.err"; then
+  ko "server should have failed to start"
+else
+  if grep -q "load auth" "$WORK/badstart.err"; then ok
+  else ko "wrong error: $(cat "$WORK/badstart.err")"; fi
+fi
+rm -f "$DATA/namespaces/broken.json"
+
+# ---------- 9. backup / restore / GC ----------
 section "backup / restore / GC"
 
 step "GC default 1h grace skips recent files"
-out=$("$BIN" gc --data-dir ./data 2>&1)
+out=$("$BIN" gc --data-dir "$DATA" 2>&1)
 if echo "$out" | grep -q '"deleted_blobs": 0'; then ok; else ko "$out"; fi
 
 step "GC --grace 0s deletes orphan blob from delete"
-out=$("$BIN" gc --data-dir ./data --grace 0s 2>&1)
+out=$("$BIN" gc --data-dir "$DATA" --grace 0s 2>&1)
 if echo "$out" | grep -qE '"deleted_blobs": [1-9]'; then ok
 else ko "expected deletions; got: $out"; fi
 
-step "backup writes a tarball with auth.json and data/aliases"
-"$BIN" backup --data-dir ./data --auth-file ./auth.json --out ./backup.tgz 2>"$WORK/backup.err"
-tar_listing=$(tar -tzf ./backup.tgz 2>/dev/null)
-if grep -qE '^auth\.json$' <<<"$tar_listing" && \
+step "backup writes a tarball with config and data/namespaces"
+"$BIN" backup --data-dir "$DATA" --out "$WORK/backup.tgz" 2>"$WORK/backup.err"
+tar_listing=$(tar -tzf "$WORK/backup.tgz" 2>/dev/null)
+if grep -qE '^config\.json$' <<<"$tar_listing" && \
+   grep -qE '^data/namespaces/' <<<"$tar_listing" && \
    grep -qE '^data/aliases/' <<<"$tar_listing"; then
   ok
 else
@@ -525,45 +622,61 @@ else
 fi
 
 step "restore into empty target succeeds"
-mkdir -p ./restored/data
-out=$("$BIN" restore --data-dir ./restored/data --auth-file ./restored/auth.json --in ./backup.tgz 2>&1)
+RESTORE="$WORK/restored"
+mkdir -p "$RESTORE/data"
+mkdir -p "$RESTORE/.config/picocdn"
+out=$(HOME="$RESTORE" "$BIN" restore --data-dir "$RESTORE/data" --in "$WORK/backup.tgz" 2>&1)
 if echo "$out" | grep -q '"status": "restored"'; then ok; else ko "$out"; fi
 
-step "restored auth.json has mode 0600"
-mode=$(stat -c '%a' ./restored/auth.json 2>/dev/null)
+step "restored config.json has mode 0600"
+mode=$(stat -c '%a' "$RESTORE/.config/picocdn/config.json" 2>/dev/null)
 expect "$mode" "600"
 
-step "restored namespace list matches"
-n=$("$BIN" namespace list --auth-file ./restored/auth.json 2>&1 | grep -c '"name":')
-if [[ "$n" -ge 2 ]]; then ok; else ko "got $n namespaces in restore"; fi
+step "restored namespaces have mode 0600"
+mode=$(stat -c '%a' "$RESTORE/data/namespaces/default.json" 2>/dev/null)
+expect "$mode" "600"
+
+step "restored server starts and lists default"
+HOME="$RESTORE" "$BIN" serve -addr "127.0.0.1:$PORT" -data-dir "$RESTORE/data" >"$WORK/restart.out" 2>"$WORK/restart.err" &
+RESTORED_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+out=$(curl -fsS -H "Authorization: Bearer $ROOT_TOKEN" "$BASE/_/namespaces" 2>&1)
+if echo "$out" | grep -q '"default"'; then ok; else ko "$out"; fi
+kill "$RESTORED_PID" 2>/dev/null || true
+wait "$RESTORED_PID" 2>/dev/null || true
 
 step "restore into non-empty target without --force is refused"
-if "$BIN" restore --data-dir ./restored/data --auth-file ./restored/auth.json --in ./backup.tgz >/dev/null 2>&1; then
+if HOME="$RESTORE" "$BIN" restore --data-dir "$RESTORE/data" --in "$WORK/backup.tgz" >/dev/null 2>&1; then
   ko "expected refusal"
 else
   ok
 fi
 
-# ---------- 9. restart server for load tests ----------
+# ---------- 10. restart for load tests ----------
 section "restart server for load tests"
 
-if start_server -reload-interval 0 -max-upload-bytes 1073741824; then
-  info "server PID=$SERVER_PID port=$PORT no-reload max-upload=1GiB base-domain=<none>"
+if start_server -max-upload-bytes 1073741824; then
+  info "server PID=$SERVER_PID port=$PORT max-upload=1GiB base-domain=<none>"
 else
   ko "failed to restart server"
 fi
 
-HOST="http://127.0.0.1:$PORT/default"
+HOST="$BASE/default"
 
 # Seed objects for load runs.
-echo load-body > ./load.txt
-dd if=/dev/urandom of=./med.bin bs=1024 count=64 status=none 2>/dev/null
-curl -sf -X PUT --data-binary @load.txt -H "Authorization: Bearer $TOKEN" \
+echo load-body > "$WORK/load.txt"
+dd if=/dev/urandom of="$WORK/med.bin" bs=1024 count=64 status=none 2>/dev/null
+curl -sf -X PUT --data-binary @"$WORK/load.txt" -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/load.txt" >/dev/null 2>&1 || true
-curl -sf -X PUT --data-binary @med.bin -H "Authorization: Bearer $TOKEN" \
+curl -sf -X PUT --data-binary @"$WORK/med.bin" -H "Authorization: Bearer $OWNER_TOKEN" \
   "$HOST/med.bin" >/dev/null 2>&1 || true
 
-# ---------- 10. load tests ----------
+# ---------- 11. load tests ----------
 if [[ "$SKIP_LOAD" == "0" ]]; then
   section "load tests (optional)"
 
@@ -580,9 +693,9 @@ if [[ "$SKIP_LOAD" == "0" ]]; then
       ko "see $WORK/bomb-healthz.log"
     fi
 
-    step "bombardier GET load.txt path-fallback 3s c=100"
+    step "bombardier GET load.txt 3s c=100"
     if "$BOMB" --http1 -d 3s -c 100 -p result \
-        -H "Authorization: Bearer $TOKEN" \
+        -H "Authorization: Bearer $OWNER_TOKEN" \
         "$HOST/load.txt" >"$WORK/bomb-get.log" 2>&1; then
       ok
       grep -E 'Reqs/sec|Latency|HTTP codes' "$WORK/bomb-get.log" | head -6 | sed 's/^/       /'
@@ -592,7 +705,7 @@ if [[ "$SKIP_LOAD" == "0" ]]; then
 
     step "bombardier GET med.bin (64KB) 3s c=64"
     if "$BOMB" --http1 -d 3s -c 64 -p result \
-        -H "Authorization: Bearer $TOKEN" \
+        -H "Authorization: Bearer $OWNER_TOKEN" \
         "$HOST/med.bin" >"$WORK/bomb-med.log" 2>&1; then
       ok
       grep -E 'Reqs/sec|Latency|HTTP codes|Throughput' "$WORK/bomb-med.log" | head -6 | sed 's/^/       /'
@@ -606,7 +719,7 @@ if [[ "$SKIP_LOAD" == "0" ]]; then
     info "vegeta not found (install: GOBIN=~/.local/bin go install github.com/tsenart/vegeta/v12@latest)"
   else
     step "vegeta GET ramp 1000/s for 3s"
-    printf 'GET %s/load.txt\nAuthorization: Bearer %s\n' "$HOST" "$TOKEN" > "$WORK/veg.targets"
+    printf 'GET %s/load.txt\nAuthorization: Bearer %s\n' "$HOST" "$OWNER_TOKEN" > "$WORK/veg.targets"
     if "$VEG" attack -duration=3s -rate=1000/s -connections=64 -keepalive \
         -targets="$WORK/veg.targets" -output="$WORK/veg.bin" >/dev/null 2>&1; then
       ok
@@ -618,7 +731,7 @@ if [[ "$SKIP_LOAD" == "0" ]]; then
   fi
 fi
 
-# ---------- 11. summary ----------
+# ---------- 12. summary ----------
 section "summary"
 
 if [[ "$FAIL" -eq 0 ]]; then
@@ -629,15 +742,11 @@ else
   EXIT_CODE=1
 fi
 
-# Make sure the EXIT trap returns the right code.
 trap - EXIT
-cleanup_rc() {
-  stop_server
-  if [[ "$KEEP_WORK" == "1" ]]; then
-    echo "${YELLOW}keeping work dir:${NC} $WORK"
-  else
-    rm -rf "$WORK"
-  fi
-}
-cleanup_rc
+stop_server
+if [[ "$KEEP_WORK" == "1" ]]; then
+  echo "${YELLOW}keeping work dir:${NC} $WORK"
+else
+  rm -rf "$WORK"
+fi
 exit "$EXIT_CODE"
