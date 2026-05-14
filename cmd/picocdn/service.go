@@ -89,8 +89,7 @@ func runInstall() error {
 	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 	_ = exec.Command("systemctl", "--user", "enable", "picocdn").Run()
 
-	out, _ := exec.Command("systemctl", "--user", "is-active", "picocdn").Output()
-	if strings.TrimSpace(string(out)) == "active" {
+	if serviceIsActive() {
 		fmt.Println("\nInstalled. Service is running; restart it with: picocdn restart")
 	} else {
 		fmt.Println("\nInstalled. Run: picocdn start")
@@ -106,6 +105,18 @@ func runUninstall() error {
 	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 	fmt.Println("uninstalled")
 	return nil
+}
+
+func serviceIsActive() bool {
+	out, _ := exec.Command("systemctl", "--user", "is-active", "picocdn").Output()
+	return strings.TrimSpace(string(out)) == "active"
+}
+
+func serviceNextCommand() string {
+	if serviceIsActive() {
+		return "restart with: picocdn restart"
+	}
+	return "start with: picocdn start"
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

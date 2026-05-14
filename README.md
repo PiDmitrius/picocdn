@@ -31,6 +31,9 @@ The user service listens on `127.0.0.1:8080` by default, stores data in
 `~/.local/share/picocdn`, and reads optional environment overrides from
 `~/.config/picocdn/picocdn.env`.
 
+`examples/picocdn.service` is a reference template; `picocdn install` writes
+an equivalent user service with the installed binary path substituted.
+
 Subdomain routing (`https://{namespace}.your-domain.tld/...`) is **opt-in** —
 turn it on by passing `-base-domain your-domain.tld` and putting Caddy with
 wildcard DNS in front. Out of the box you address objects through the path
@@ -74,6 +77,9 @@ picocdn version       print version
 - If `source_dir` is empty, it downloads the latest GitHub release and installs it.
 - If `source_dir` is set, it bumps the local patch version, rebuilds from source,
   and installs that binary instead.
+
+After a source update, commit the version bump; when it is ready for release,
+push a `v*` tag to publish binaries.
 
 Local development setup:
 

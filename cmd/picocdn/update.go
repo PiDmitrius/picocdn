@@ -169,6 +169,6 @@ func runDownloadedInstall(binPath string) error {
 	if err := install.Run(); err != nil {
 		return fmt.Errorf("install failed: %w", err)
 	}
-	fmt.Println("restart with: picocdn restart")
+	fmt.Println(serviceNextCommand())
 	return nil
 }
