@@ -137,37 +137,71 @@ func TestRotateOwnerInvalidatesOld(t *testing.T) {
 	}
 }
 
-func TestSetIndexFile(t *testing.T) {
-	s, dir := newStore(t)
+func TestIndexFileDefault(t *testing.T) {
+	s, _ := newStore(t)
 	if _, err := s.CreateNamespace("ns"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.IndexFile("ns"); got != "" {
-		t.Fatalf("default index = %q, want empty", got)
+	if got := s.IndexFile("ns"); got != DefaultIndexFile {
+		t.Fatalf("default index = %q, want %q", got, DefaultIndexFile)
 	}
-	if err := s.SetIndexFile("ns", "index.html"); err != nil {
+}
+
+func TestSetIndexOverride(t *testing.T) {
+	s, _ := newStore(t)
+	if _, err := s.CreateNamespace("ns"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.IndexFile("ns"); got != "index.html" {
-		t.Fatalf("after set: %q", got)
+	if err := s.SetIndex("ns", "main.html", false); err != nil {
+		t.Fatal(err)
 	}
-	if err := s.SetIndexFile("ns", ""); err != nil {
+	if got := s.IndexFile("ns"); got != "main.html" {
+		t.Fatalf("after override: %q", got)
+	}
+	// reset to default with empty file
+	if err := s.SetIndex("ns", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.IndexFile("ns"); got != DefaultIndexFile {
+		t.Fatalf("after reset: %q, want default", got)
+	}
+}
+
+func TestSetIndexDisable(t *testing.T) {
+	s, _ := newStore(t)
+	if _, err := s.CreateNamespace("ns"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndex("ns", "", true); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.IndexFile("ns"); got != "" {
-		t.Fatalf("after clear: %q", got)
+		t.Fatalf("after disable: %q, want empty", got)
+	}
+	// re-enable with default
+	if err := s.SetIndex("ns", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.IndexFile("ns"); got != DefaultIndexFile {
+		t.Fatalf("after re-enable: %q, want default", got)
+	}
+}
+
+func TestSetIndexRejectsBadFile(t *testing.T) {
+	s, _ := newStore(t)
+	if _, err := s.CreateNamespace("ns"); err != nil {
+		t.Fatal(err)
 	}
 	for _, bad := range []string{"..", "../etc", "a/b", "with space", "\x00"} {
 		t.Run("bad="+bad, func(t *testing.T) {
-			if err := s.SetIndexFile("ns", bad); err == nil {
+			if err := s.SetIndex("ns", bad, false); err == nil {
 				t.Fatalf("expected error for %q", bad)
 			}
 		})
 	}
-	_ = dir
 }
 
-func TestIndexFilePersistsAcrossReload(t *testing.T) {
+func TestIndexPersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewStore(dir, nil)
 	if err != nil {
@@ -176,15 +210,36 @@ func TestIndexFilePersistsAcrossReload(t *testing.T) {
 	if _, err := s.CreateNamespace("ns"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetIndexFile("ns", "index.html"); err != nil {
+	if err := s.SetIndex("ns", "main.html", false); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := NewStore(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reloaded.IndexFile("ns"); got != "index.html" {
+	if got := reloaded.IndexFile("ns"); got != "main.html" {
 		t.Fatalf("after reload: %q", got)
+	}
+}
+
+func TestIndexDisabledPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateNamespace("ns"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndex("ns", "", true); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.IndexFile("ns"); got != "" {
+		t.Fatalf("after reload disabled: %q, want empty", got)
 	}
 }
 

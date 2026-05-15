@@ -363,7 +363,8 @@ type publicRequest struct {
 }
 
 type indexRequest struct {
-	File string `json:"file"`
+	File     string `json:"file"`
+	Disabled bool   `json:"disabled"`
 }
 
 func (s *Server) handleAdminNamespaceCreate(w http.ResponseWriter, r *http.Request) {
@@ -564,7 +565,7 @@ func (s *Server) handleAdminSetIndex(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if err := s.auth.SetIndexFile(name, req.File); err != nil {
+	if err := s.auth.SetIndex(name, req.File, req.Disabled); err != nil {
 		if errors.Is(err, auth.ErrNamespaceNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -578,8 +579,9 @@ func (s *Server) handleAdminSetIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"namespace":  name,
-		"index_file": req.File,
+		"namespace":      name,
+		"index_file":     s.auth.IndexFile(name),
+		"index_disabled": req.Disabled,
 	})
 }
 

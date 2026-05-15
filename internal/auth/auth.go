@@ -39,16 +39,21 @@ var (
 	subPermissionsOrdered = []string{"read", "write", "delete"}
 )
 
+// DefaultIndexFile is served on directory-style requests when a namespace
+// has no explicit override and isn't disabled.
+const DefaultIndexFile = "index.html"
+
 // Namespace is the on-disk format of <data-dir>/namespaces/<name>.json.
 type Namespace struct {
-	Version      int       `json:"version"`
-	Name         string    `json:"name"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	OwnerTokenID string    `json:"owner_token_id"`
-	PublicRead   bool      `json:"public_read,omitempty"`
-	IndexFile    string    `json:"index_file,omitempty"`
-	Tokens       []Token   `json:"tokens"`
+	Version       int       `json:"version"`
+	Name          string    `json:"name"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	OwnerTokenID  string    `json:"owner_token_id"`
+	PublicRead    bool      `json:"public_read,omitempty"`
+	IndexFile     string    `json:"index_file,omitempty"`     // empty = use DefaultIndexFile
+	IndexDisabled bool      `json:"index_disabled,omitempty"` // true = no directory index at all
+	Tokens        []Token   `json:"tokens"`
 }
 
 type Token struct {
@@ -92,13 +97,14 @@ type TokenInfo struct {
 }
 
 type NamespaceInfo struct {
-	Name         string    `json:"name"`
-	OwnerTokenID string    `json:"owner_token_id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	TokenCount   int       `json:"token_count"`
-	PublicRead   bool      `json:"public_read"`
-	IndexFile    string    `json:"index_file,omitempty"`
+	Name          string    `json:"name"`
+	OwnerTokenID  string    `json:"owner_token_id"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	TokenCount    int       `json:"token_count"`
+	PublicRead    bool      `json:"public_read"`
+	IndexFile     string    `json:"index_file"`
+	IndexDisabled bool      `json:"index_disabled"`
 }
 
 type RootTokenInfo struct {
@@ -430,7 +436,9 @@ func (s *Store) IsPublicRead(namespace string) bool {
 	return cns.ns.PublicRead
 }
 
-// IndexFile returns the configured index filename for the namespace, or "".
+// IndexFile returns the effective directory-index filename for the namespace.
+// Returns "" if disabled or if the namespace does not exist. An empty stored
+// IndexFile means "use DefaultIndexFile".
 func (s *Store) IndexFile(namespace string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -438,7 +446,13 @@ func (s *Store) IndexFile(namespace string) string {
 	if !ok {
 		return ""
 	}
-	return cns.ns.IndexFile
+	if cns.ns.IndexDisabled {
+		return ""
+	}
+	if cns.ns.IndexFile != "" {
+		return cns.ns.IndexFile
+	}
+	return DefaultIndexFile
 }
 
 // --- Admin API (Lock) ---
@@ -607,10 +621,14 @@ func (s *Store) RevokeToken(namespace, tokenID string) error {
 	return nil
 }
 
-// SetIndexFile configures (or clears, with "") the directory index filename
-// served when a request lands on namespace root or a path ending in "/".
-// The value must be a basename (no path separators, no "..").
-func (s *Store) SetIndexFile(namespace, file string) error {
+// SetIndex configures the directory-index behaviour for the namespace.
+//
+//	file=""              → reset to DefaultIndexFile
+//	file="other.html"    → override
+//	disabled=true        → no directory index at all
+//
+// The file name must be a plain basename if non-empty.
+func (s *Store) SetIndex(namespace, file string, disabled bool) error {
 	if file != "" {
 		if !indexFilePattern.MatchString(file) || file == "." || file == ".." {
 			return ErrInvalidIndexFile
@@ -622,12 +640,13 @@ func (s *Store) SetIndexFile(namespace, file string) error {
 	if !ok {
 		return ErrNamespaceNotFound
 	}
-	if cns.ns.IndexFile == file {
+	if cns.ns.IndexFile == file && cns.ns.IndexDisabled == disabled {
 		return nil
 	}
 	updated := *cns.ns
 	updated.Tokens = append([]Token(nil), cns.ns.Tokens...)
 	updated.IndexFile = file
+	updated.IndexDisabled = disabled
 	updated.UpdatedAt = time.Now().UTC()
 	if err := s.persistLocked(&updated); err != nil {
 		return err
@@ -670,14 +689,22 @@ func (s *Store) ListNamespaces() []NamespaceInfo {
 	out := make([]NamespaceInfo, 0, len(names))
 	for _, name := range names {
 		ns := s.namespaces[name].ns
+		effective := ns.IndexFile
+		if !ns.IndexDisabled && effective == "" {
+			effective = DefaultIndexFile
+		}
+		if ns.IndexDisabled {
+			effective = ""
+		}
 		out = append(out, NamespaceInfo{
-			Name:         ns.Name,
-			OwnerTokenID: ns.OwnerTokenID,
-			CreatedAt:    ns.CreatedAt,
-			UpdatedAt:    ns.UpdatedAt,
-			TokenCount:   len(ns.Tokens),
-			PublicRead:   ns.PublicRead,
-			IndexFile:    ns.IndexFile,
+			Name:          ns.Name,
+			OwnerTokenID:  ns.OwnerTokenID,
+			CreatedAt:     ns.CreatedAt,
+			UpdatedAt:     ns.UpdatedAt,
+			TokenCount:    len(ns.Tokens),
+			PublicRead:    ns.PublicRead,
+			IndexFile:     effective,
+			IndexDisabled: ns.IndexDisabled,
 		})
 	}
 	return out

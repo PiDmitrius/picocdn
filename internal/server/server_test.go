@@ -520,58 +520,73 @@ func TestAdminRotateOwner(t *testing.T) {
 	}
 }
 
-func TestAdminSetIndexAndServe(t *testing.T) {
+func TestDefaultIndexServedWithoutAdminAction(t *testing.T) {
 	ts := buildServer(t, nil)
-	// seed index.html under namespace root
+	// seed index.html under namespace root — no admin call needed
 	if rec := doPut(t, ts.srv, "", "/default/index.html", ts.ownerToken, "<h1>root</h1>", "text/html"); rec.Code != http.StatusCreated {
 		t.Fatalf("seed PUT status = %d", rec.Code)
 	}
-	// seed index.html under /sub/
-	if rec := doPut(t, ts.srv, "", "/default/sub/index.html", ts.ownerToken, "<h1>sub</h1>", "text/html"); rec.Code != http.StatusCreated {
-		t.Fatalf("seed sub PUT status = %d", rec.Code)
-	}
-	// configure index file via admin
-	rec := httptest.NewRecorder()
-	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]string{"file": "index.html"}))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("set index status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	// make namespace public-read
 	if err := ts.authStore.SetPublicRead("default", true); err != nil {
 		t.Fatal(err)
 	}
-	// GET namespace root (anon) → index.html
+	for _, path := range []string{"/default/", "/default"} {
+		rec := httptest.NewRecorder()
+		ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, path, "", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "root") {
+			t.Fatalf("%s body = %q", path, rec.Body.String())
+		}
+	}
+}
+
+func TestAdminIndexOverrideAndDisable(t *testing.T) {
+	ts := buildServer(t, nil)
+	if rec := doPut(t, ts.srv, "", "/default/index.html", ts.ownerToken, "<h1>root</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed root PUT status = %d", rec.Code)
+	}
+	if rec := doPut(t, ts.srv, "", "/default/main.html", ts.ownerToken, "<h1>main</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed main PUT status = %d", rec.Code)
+	}
+	if err := ts.authStore.SetPublicRead("default", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// override to main.html
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"file": "main.html"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("override status = %d body=%s", rec.Code, rec.Body.String())
+	}
 	rec = httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("root anon GET status = %d body=%s", rec.Code, rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "main") {
+		t.Fatalf("override body = %q", rec.Body.String())
 	}
+
+	// reset to default by setting file=""
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"file": ""}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
 	if !strings.Contains(rec.Body.String(), "root") {
-		t.Fatalf("body = %q", rec.Body.String())
+		t.Fatalf("default body after reset = %q", rec.Body.String())
 	}
-	// GET namespace root without trailing slash (path fallback hits /test)
+
+	// disable entirely — anon GET / now requires token, falls through to handleList
 	rec = httptest.NewRecorder()
-	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default", "", nil))
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"disabled": true}))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("root no-slash status = %d", rec.Code)
+		t.Fatalf("disable status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "root") {
-		t.Fatalf("no-slash body = %q", rec.Body.String())
-	}
-	// GET subdir with trailing slash → sub/index.html
 	rec = httptest.NewRecorder()
-	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/sub/", "", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("subdir status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "sub") {
-		t.Fatalf("subdir body = %q", rec.Body.String())
-	}
-	// subdir without index file should 404
-	rec = httptest.NewRecorder()
-	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/nosuch/", "", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("missing subdir status = %d", rec.Code)
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled anon root status = %d, want 401 (listing requires token)", rec.Code)
 	}
 }
 
