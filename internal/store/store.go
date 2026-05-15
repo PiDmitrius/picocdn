@@ -132,6 +132,27 @@ func (s *Store) GetObject(namespace, objectPath string) (*Object, error) {
 	return &obj, nil
 }
 
+// HasAlias reports whether an alias file exists for the given namespace+path
+// without parsing it. Cheap stat-only check, useful for index-file lookup.
+func (s *Store) HasAlias(namespace, objectPath string) bool {
+	if !isValidNamespace(namespace) {
+		return false
+	}
+	cleaned, err := cleanObjectPath(objectPath)
+	if err != nil {
+		return false
+	}
+	aliasPath, err := s.safeAliasPath(namespace, cleaned)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(aliasPath)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular()
+}
+
 // DeleteNamespaceAliases removes <aliases-root>/<namespace> recursively. Blobs
 // are intentionally left behind for GC to reclaim. Missing dir is not an error.
 func (s *Store) DeleteNamespaceAliases(namespace string) error {

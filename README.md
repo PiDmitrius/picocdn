@@ -166,6 +166,10 @@ DELETE /_/namespaces/{ns}/tokens/{id}             owner or root
 
 POST   /_/namespaces/{ns}/public                  owner or root
   body: {"on": true|false}
+
+POST   /_/namespaces/{ns}/index                   owner or root
+  body: {"file": "index.html"}    set the directory-index filename
+  body: {"file": ""}              disable
 ```
 
 Namespace names must match `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` so they stay
@@ -269,6 +273,35 @@ When public-read is enabled, `GET`/`HEAD` on individual objects work without
 a token. **Listing always requires a token** even on public-read namespaces.
 `PUT`/`DELETE` still require the relevant permission. Cache-Control is relaxed
 to `public, max-age=300` for objects served from public namespaces.
+
+## Directory index
+
+Each namespace can declare an index filename (e.g. `index.html`) that is
+served automatically when a request lands on the namespace root or any path
+ending with `/`:
+
+```sh
+curl -fsS -H "Authorization: Bearer $OWNER" \
+     -d '{"file":"index.html"}' \
+     http://127.0.0.1:8080/_/namespaces/site/index
+# disable:
+curl -fsS -H "Authorization: Bearer $OWNER" \
+     -d '{"file":""}' \
+     http://127.0.0.1:8080/_/namespaces/site/index
+```
+
+With `index_file=index.html` set on namespace `site` (and `public_read=on`):
+
+- `GET https://site.example.com/`          → serves `/index.html`
+- `GET https://site.example.com/blog/`     → serves `/blog/index.html`
+- `GET https://example.com/site/`          → serves `/site/index.html` (path fallback)
+- `GET https://site.example.com/missing/`  → 404 (no `missing/index.html` on disk)
+
+The index file is served through the same path as a regular `GET`, so
+`public_read`, ETag, Range, and Cache-Control all apply uniformly. Listing
+behaviour (`GET /{ns}/` without `index_file` set, or with the file absent)
+is unchanged and still requires a token. Index filename validation: ASCII
+letters/digits/`.`/`_`/`-`, no `/`, no `..`, no `.`.
 
 ## Backup, restore, GC
 

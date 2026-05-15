@@ -520,6 +520,70 @@ func TestAdminRotateOwner(t *testing.T) {
 	}
 }
 
+func TestAdminSetIndexAndServe(t *testing.T) {
+	ts := buildServer(t, nil)
+	// seed index.html under namespace root
+	if rec := doPut(t, ts.srv, "", "/default/index.html", ts.ownerToken, "<h1>root</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed PUT status = %d", rec.Code)
+	}
+	// seed index.html under /sub/
+	if rec := doPut(t, ts.srv, "", "/default/sub/index.html", ts.ownerToken, "<h1>sub</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed sub PUT status = %d", rec.Code)
+	}
+	// configure index file via admin
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]string{"file": "index.html"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set index status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	// make namespace public-read
+	if err := ts.authStore.SetPublicRead("default", true); err != nil {
+		t.Fatal(err)
+	}
+	// GET namespace root (anon) → index.html
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root anon GET status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "root") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	// GET namespace root without trailing slash (path fallback hits /test)
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default", "", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root no-slash status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "root") {
+		t.Fatalf("no-slash body = %q", rec.Body.String())
+	}
+	// GET subdir with trailing slash → sub/index.html
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/sub/", "", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subdir status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "sub") {
+		t.Fatalf("subdir body = %q", rec.Body.String())
+	}
+	// subdir without index file should 404
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/nosuch/", "", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing subdir status = %d", rec.Code)
+	}
+}
+
+func TestAdminSetIndexRejectsBadValue(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]string{"file": "../etc/passwd"}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAdminSetPublic(t *testing.T) {
 	ts := buildServer(t, nil)
 	// seed

@@ -27,7 +27,10 @@ const (
 // Namespace name: ASCII lowercase letter first, letters/digits/dash inside,
 // must end with letter or digit, 1..63 chars. Leading underscore is impossible
 // by construction — the admin plane lives under /_/.
-var namespacePattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	namespacePattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	indexFilePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+)
 
 var (
 	validSubPermissions   = map[string]struct{}{"read": {}, "write": {}, "delete": {}}
@@ -44,6 +47,7 @@ type Namespace struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	OwnerTokenID string    `json:"owner_token_id"`
 	PublicRead   bool      `json:"public_read,omitempty"`
+	IndexFile    string    `json:"index_file,omitempty"`
 	Tokens       []Token   `json:"tokens"`
 }
 
@@ -94,6 +98,7 @@ type NamespaceInfo struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	TokenCount   int       `json:"token_count"`
 	PublicRead   bool      `json:"public_read"`
+	IndexFile    string    `json:"index_file,omitempty"`
 }
 
 type RootTokenInfo struct {
@@ -262,6 +267,11 @@ func validateNamespaceFile(ns *Namespace) error {
 	if ns.OwnerTokenID == "" {
 		return fmt.Errorf("missing owner_token_id")
 	}
+	if ns.IndexFile != "" {
+		if !indexFilePattern.MatchString(ns.IndexFile) || ns.IndexFile == "." || ns.IndexFile == ".." {
+			return fmt.Errorf("invalid index_file %q", ns.IndexFile)
+		}
+	}
 	seenIDs := make(map[string]struct{}, len(ns.Tokens))
 	seenHashes := make(map[string]struct{}, len(ns.Tokens))
 	ownerCount := 0
@@ -418,6 +428,17 @@ func (s *Store) IsPublicRead(namespace string) bool {
 		return false
 	}
 	return cns.ns.PublicRead
+}
+
+// IndexFile returns the configured index filename for the namespace, or "".
+func (s *Store) IndexFile(namespace string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cns, ok := s.namespaces[namespace]
+	if !ok {
+		return ""
+	}
+	return cns.ns.IndexFile
 }
 
 // --- Admin API (Lock) ---
@@ -586,6 +607,35 @@ func (s *Store) RevokeToken(namespace, tokenID string) error {
 	return nil
 }
 
+// SetIndexFile configures (or clears, with "") the directory index filename
+// served when a request lands on namespace root or a path ending in "/".
+// The value must be a basename (no path separators, no "..").
+func (s *Store) SetIndexFile(namespace, file string) error {
+	if file != "" {
+		if !indexFilePattern.MatchString(file) || file == "." || file == ".." {
+			return ErrInvalidIndexFile
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cns, ok := s.namespaces[namespace]
+	if !ok {
+		return ErrNamespaceNotFound
+	}
+	if cns.ns.IndexFile == file {
+		return nil
+	}
+	updated := *cns.ns
+	updated.Tokens = append([]Token(nil), cns.ns.Tokens...)
+	updated.IndexFile = file
+	updated.UpdatedAt = time.Now().UTC()
+	if err := s.persistLocked(&updated); err != nil {
+		return err
+	}
+	s.namespaces[namespace] = compileNamespace(&updated)
+	return nil
+}
+
 // SetPublicRead flips the namespace public-read flag.
 func (s *Store) SetPublicRead(namespace string, public bool) error {
 	s.mu.Lock()
@@ -627,6 +677,7 @@ func (s *Store) ListNamespaces() []NamespaceInfo {
 			UpdatedAt:    ns.UpdatedAt,
 			TokenCount:   len(ns.Tokens),
 			PublicRead:   ns.PublicRead,
+			IndexFile:    ns.IndexFile,
 		})
 	}
 	return out
@@ -839,4 +890,5 @@ var (
 	ErrTokenNotFound        = errors.New("token not found")
 	ErrCannotRevokeOwner    = errors.New("cannot revoke owner token; use rotate-owner")
 	ErrInvalidNamespaceName = errors.New("invalid namespace name")
+	ErrInvalidIndexFile     = errors.New("invalid index file name")
 )

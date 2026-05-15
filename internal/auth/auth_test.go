@@ -137,6 +137,57 @@ func TestRotateOwnerInvalidatesOld(t *testing.T) {
 	}
 }
 
+func TestSetIndexFile(t *testing.T) {
+	s, dir := newStore(t)
+	if _, err := s.CreateNamespace("ns"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.IndexFile("ns"); got != "" {
+		t.Fatalf("default index = %q, want empty", got)
+	}
+	if err := s.SetIndexFile("ns", "index.html"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.IndexFile("ns"); got != "index.html" {
+		t.Fatalf("after set: %q", got)
+	}
+	if err := s.SetIndexFile("ns", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.IndexFile("ns"); got != "" {
+		t.Fatalf("after clear: %q", got)
+	}
+	for _, bad := range []string{"..", "../etc", "a/b", "with space", "\x00"} {
+		t.Run("bad="+bad, func(t *testing.T) {
+			if err := s.SetIndexFile("ns", bad); err == nil {
+				t.Fatalf("expected error for %q", bad)
+			}
+		})
+	}
+	_ = dir
+}
+
+func TestIndexFilePersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateNamespace("ns"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndexFile("ns", "index.html"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.IndexFile("ns"); got != "index.html" {
+		t.Fatalf("after reload: %q", got)
+	}
+}
+
 func TestSetPublicRead(t *testing.T) {
 	s, _ := newStore(t)
 	if _, err := s.CreateNamespace("ns"); err != nil {
