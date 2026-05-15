@@ -166,6 +166,12 @@ DELETE /_/namespaces/{ns}/tokens/{id}             owner or root
 
 POST   /_/namespaces/{ns}/public                  owner or root
   body: {"on": true|false}
+
+POST   /_/namespaces/{ns}/index                   owner or root
+  body: {"file": "main.html"}     override the directory-index filename
+  body: {"file": ""}              reset to default ("index.html")
+  body: {"disabled": true}        turn the directory index off entirely
+  body: {"disabled": false}       turn it back on (uses default unless file is set)
 ```
 
 Namespace names must match `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` so they stay
@@ -269,6 +275,44 @@ When public-read is enabled, `GET`/`HEAD` on individual objects work without
 a token. **Listing always requires a token** even on public-read namespaces.
 `PUT`/`DELETE` still require the relevant permission. Cache-Control is relaxed
 to `public, max-age=300` for objects served from public namespaces.
+
+## Directory index
+
+By default every namespace serves `index.html` when a request lands on the
+namespace root or any path ending with `/`. Upload an `index.html` and it just
+works — no admin call needed.
+
+```sh
+# override the filename for a specific namespace
+curl -fsS -H "Authorization: Bearer $OWNER" \
+     -d '{"file":"main.html"}' \
+     http://127.0.0.1:8080/_/namespaces/site/index
+
+# reset back to the "index.html" default
+curl -fsS -H "Authorization: Bearer $OWNER" \
+     -d '{"file":""}' \
+     http://127.0.0.1:8080/_/namespaces/site/index
+
+# turn the directory index off entirely
+curl -fsS -H "Authorization: Bearer $OWNER" \
+     -d '{"disabled":true}' \
+     http://127.0.0.1:8080/_/namespaces/site/index
+```
+
+Effective lookup:
+
+- `GET https://site.example.com/`          → serves `/index.html` (or override)
+- `GET https://site.example.com/blog/`     → serves `/blog/index.html`
+- `GET https://example.com/site/`          → serves `/site/index.html` (path fallback)
+- `GET https://site.example.com/missing/`  → 404 (no `missing/index.html` on disk)
+
+When the index is disabled, `GET /{ns}/` returns the listing response
+(which always requires a token, even on public-read namespaces).
+
+Override filename validation: ASCII letters/digits/`.`/`_`/`-`, no `/`,
+no `..`, no `.`. The index file is served through the same code path as a
+regular `GET`, so `public_read`, ETag, Range, and Cache-Control all apply
+uniformly.
 
 ## Backup, restore, GC
 

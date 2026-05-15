@@ -520,6 +520,85 @@ func TestAdminRotateOwner(t *testing.T) {
 	}
 }
 
+func TestDefaultIndexServedWithoutAdminAction(t *testing.T) {
+	ts := buildServer(t, nil)
+	// seed index.html under namespace root — no admin call needed
+	if rec := doPut(t, ts.srv, "", "/default/index.html", ts.ownerToken, "<h1>root</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed PUT status = %d", rec.Code)
+	}
+	if err := ts.authStore.SetPublicRead("default", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/default/", "/default"} {
+		rec := httptest.NewRecorder()
+		ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, path, "", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "root") {
+			t.Fatalf("%s body = %q", path, rec.Body.String())
+		}
+	}
+}
+
+func TestAdminIndexOverrideAndDisable(t *testing.T) {
+	ts := buildServer(t, nil)
+	if rec := doPut(t, ts.srv, "", "/default/index.html", ts.ownerToken, "<h1>root</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed root PUT status = %d", rec.Code)
+	}
+	if rec := doPut(t, ts.srv, "", "/default/main.html", ts.ownerToken, "<h1>main</h1>", "text/html"); rec.Code != http.StatusCreated {
+		t.Fatalf("seed main PUT status = %d", rec.Code)
+	}
+	if err := ts.authStore.SetPublicRead("default", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// override to main.html
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"file": "main.html"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("override status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
+	if !strings.Contains(rec.Body.String(), "main") {
+		t.Fatalf("override body = %q", rec.Body.String())
+	}
+
+	// reset to default by setting file=""
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"file": ""}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
+	if !strings.Contains(rec.Body.String(), "root") {
+		t.Fatalf("default body after reset = %q", rec.Body.String())
+	}
+
+	// disable entirely — anon GET / now requires token, falls through to handleList
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]any{"disabled": true}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled anon root status = %d, want 401 (listing requires token)", rec.Code)
+	}
+}
+
+func TestAdminSetIndexRejectsBadValue(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/index", ts.ownerToken, map[string]string{"file": "../etc/passwd"}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAdminSetPublic(t *testing.T) {
 	ts := buildServer(t, nil)
 	// seed

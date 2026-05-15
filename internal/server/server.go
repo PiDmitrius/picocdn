@@ -103,10 +103,28 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /_/namespaces/{ns}/tokens", s.handleAdminTokenList)
 	s.mux.HandleFunc("DELETE /_/namespaces/{ns}/tokens/{id}", s.handleAdminTokenRevoke)
 	s.mux.HandleFunc("POST /_/namespaces/{ns}/public", s.handleAdminSetPublic)
+	s.mux.HandleFunc("POST /_/namespaces/{ns}/index", s.handleAdminSetIndex)
 
 	// Object plane.
 	s.mux.HandleFunc("/{namespace}", s.handlePathFallback)
 	s.mux.HandleFunc("/{namespace}/{objectPath...}", s.handlePathFallback)
+}
+
+// tryServeIndex looks up the namespace's configured index file under urlPath
+// and, if the object exists, serves it via handleGet (so public_read / auth
+// rules apply uniformly). Returns true if it handled the response. urlPath
+// must be "/" or end with "/".
+func (s *Server) tryServeIndex(w http.ResponseWriter, r *http.Request, namespace, urlPath string) bool {
+	indexFile := s.auth.IndexFile(namespace)
+	if indexFile == "" {
+		return false
+	}
+	indexPath := urlPath + indexFile
+	if !s.store.HasAlias(namespace, indexPath) {
+		return false
+	}
+	s.handleGet(w, r, namespace, indexPath)
+	return true
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -135,17 +153,31 @@ func (s *Server) handlePathFallback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, namespace, urlPath string) {
 	switch r.Method {
 	case http.MethodGet:
-		if urlPath == "/" {
-			s.handleList(w, r, namespace)
+		if urlPath == "/" || strings.HasSuffix(urlPath, "/") {
+			if served := s.tryServeIndex(w, r, namespace, urlPath); served {
+				return
+			}
+			if urlPath == "/" {
+				s.handleList(w, r, namespace)
+				return
+			}
+			writeError(w, http.StatusNotFound, "object not found")
 			return
 		}
 		s.handleGet(w, r, namespace, urlPath)
 	case http.MethodHead:
-		if urlPath == "/" {
-			if !s.requirePermission(w, r, namespace, "read") {
+		if urlPath == "/" || strings.HasSuffix(urlPath, "/") {
+			if served := s.tryServeIndex(w, r, namespace, urlPath); served {
 				return
 			}
-			w.WriteHeader(http.StatusOK)
+			if urlPath == "/" {
+				if !s.requirePermission(w, r, namespace, "read") {
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeError(w, http.StatusNotFound, "object not found")
 			return
 		}
 		s.handleGet(w, r, namespace, urlPath)
@@ -330,6 +362,11 @@ type publicRequest struct {
 	On bool `json:"on"`
 }
 
+type indexRequest struct {
+	File     string `json:"file"`
+	Disabled bool   `json:"disabled"`
+}
+
 func (s *Server) handleAdminNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 	actor, ok := s.requireRoot(w, r)
 	if !ok {
@@ -511,6 +548,41 @@ func (s *Server) handleAdminTokenRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminSetIndex(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("ns")
+	if err := auth.ValidateNamespaceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actor, ok := s.requireNamespaceAdmin(w, r, name)
+	if !ok {
+		return
+	}
+	setActor(w, actor)
+	var req indexRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if err := s.auth.SetIndex(name, req.File, req.Disabled); err != nil {
+		if errors.Is(err, auth.ErrNamespaceNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, auth.ErrInvalidIndexFile) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"namespace":      name,
+		"index_file":     s.auth.IndexFile(name),
+		"index_disabled": req.Disabled,
+	})
 }
 
 func (s *Server) handleAdminSetPublic(w http.ResponseWriter, r *http.Request) {

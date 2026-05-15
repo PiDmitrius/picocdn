@@ -528,6 +528,67 @@ step "DELETE /_/namespaces/other returns 204"
 expect "$(http_status -X DELETE -H "Authorization: Bearer $ROOT_TOKEN" \
   "$ADMIN/other")" "204"
 
+# ---- index_file (default-on with index.html) ----
+step "seed default/index.html, default/welcome/index.html and default/main.html"
+echo '<h1>root</h1>' > "$WORK/root.html"
+echo '<h1>welcome</h1>' > "$WORK/welcome.html"
+echo '<h1>main</h1>' > "$WORK/main.html"
+if curl -fsS -X PUT --data-binary @"$WORK/root.html" -H "Authorization: Bearer $OWNER_TOKEN" \
+     -H 'Content-Type: text/html' "$HOST/index.html" >/dev/null 2>&1 \
+   && curl -fsS -X PUT --data-binary @"$WORK/welcome.html" -H "Authorization: Bearer $OWNER_TOKEN" \
+     -H 'Content-Type: text/html' "$HOST/welcome/index.html" >/dev/null 2>&1 \
+   && curl -fsS -X PUT --data-binary @"$WORK/main.html" -H "Authorization: Bearer $OWNER_TOKEN" \
+     -H 'Content-Type: text/html' "$HOST/main.html" >/dev/null 2>&1; then ok
+else ko "PUT failed"; fi
+
+step "anon GET /default/ serves index.html by default (no admin call)"
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":true}' >/dev/null
+body=$(curl -fsS "$HOST/" 2>/dev/null)
+if [[ "$body" == *"root"* ]]; then ok; else ko "got: $body"; fi
+
+step "anon GET /default (no slash) also serves index.html"
+body=$(curl -fsS "$HOST" 2>/dev/null)
+if [[ "$body" == *"root"* ]]; then ok; else ko "got: $body"; fi
+
+step "anon GET /default/welcome/ serves sub index.html"
+body=$(curl -fsS "$HOST/welcome/" 2>/dev/null)
+if [[ "$body" == *"welcome"* ]]; then ok; else ko "got: $body"; fi
+
+step "anon GET missing dir returns 404"
+expect "$(http_status "$HOST/nosuch/")" "404"
+
+step "POST /_/namespaces/default/index override → main.html"
+out=$(admin_call POST "$ADMIN/default/index" "$OWNER_TOKEN" '{"file":"main.html"}' 2>&1)
+if echo "$out" | grep -q '"index_file":"main.html"'; then ok; else ko "$out"; fi
+
+step "anon GET / now serves main.html"
+body=$(curl -fsS "$HOST/" 2>/dev/null)
+if [[ "$body" == *"main"* ]]; then ok; else ko "got: $body"; fi
+
+step "POST /_/namespaces/default/index reset to default with file=''"
+out=$(admin_call POST "$ADMIN/default/index" "$OWNER_TOKEN" '{"file":""}' 2>&1)
+if echo "$out" | grep -q '"index_file":"index.html"'; then ok; else ko "$out"; fi
+
+step "POST /_/namespaces/default/index disable → {disabled:true}"
+out=$(admin_call POST "$ADMIN/default/index" "$OWNER_TOKEN" '{"disabled":true}' 2>&1)
+if echo "$out" | grep -q '"index_disabled":true'; then ok; else ko "$out"; fi
+
+step "anon GET / with disabled index falls back to listing (401)"
+expect "$(http_status "$HOST/")" "401"
+
+step "re-enable index → {disabled:false}"
+admin_call POST "$ADMIN/default/index" "$OWNER_TOKEN" '{"disabled":false}' >/dev/null
+body=$(curl -fsS "$HOST/" 2>/dev/null)
+if [[ "$body" == *"root"* ]]; then ok; else ko "got: $body"; fi
+
+step "POST /_/namespaces/default/index rejects path traversal"
+expect "$(http_status -X POST -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"file":"../etc/passwd"}' \
+  "$ADMIN/default/index")" "400"
+
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":false}' >/dev/null
+
 step "deleted namespace no longer accepts PUT (404)"
 expect "$(http_status -X PUT --data-binary @"$WORK/x.txt" \
   -H "Authorization: Bearer $ROOT_TOKEN" \
