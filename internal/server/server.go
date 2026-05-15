@@ -397,6 +397,8 @@ func (s *Server) handleAdminNamespaceCreate(w http.ResponseWriter, r *http.Reque
 		"namespace":      created.Namespace,
 		"owner_token_id": created.TokenID,
 		"owner_token":    created.Token,
+		"public_read":    s.auth.IsPublicRead(created.Namespace),
+		"index_file":     s.auth.IndexFile(created.Namespace),
 	})
 }
 

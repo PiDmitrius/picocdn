@@ -248,20 +248,20 @@ func TestSetPublicRead(t *testing.T) {
 	if _, err := s.CreateNamespace("ns"); err != nil {
 		t.Fatal(err)
 	}
-	if s.IsPublicRead("ns") {
-		t.Fatal("default must be private")
-	}
-	if err := s.SetPublicRead("ns", true); err != nil {
-		t.Fatal(err)
-	}
 	if !s.IsPublicRead("ns") {
-		t.Fatal("public_read should be set")
+		t.Fatal("default must be public")
 	}
 	if err := s.SetPublicRead("ns", false); err != nil {
 		t.Fatal(err)
 	}
 	if s.IsPublicRead("ns") {
 		t.Fatal("public_read should be cleared")
+	}
+	if err := s.SetPublicRead("ns", true); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsPublicRead("ns") {
+		t.Fatal("public_read should be set back")
 	}
 }
 
