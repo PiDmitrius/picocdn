@@ -437,6 +437,10 @@ step "PUT to bare /{namespace} (list endpoint) returns 400"
 expect "$(http_status -X PUT -H "Authorization: Bearer $OWNER_TOKEN" --data-binary @"$WORK/x.txt" \
   "$HOST")" "400"
 
+step "GET / on base host returns 404 (no redirect loop)"
+status=$(curl -sS -o /dev/null -w '%{http_code}|%{redirect_url}' --max-time 5 "$BASE/")
+expect "$status" "404|"
+
 step "GET /_ returns 404 (admin discovery disabled)"
 expect "$(http_status "$BASE/_")" "404"
 

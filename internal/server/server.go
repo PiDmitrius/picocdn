@@ -93,6 +93,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 
+	// Explicitly handle bare "/" — without this, Go's ServeMux canonicalises
+	// the request to "/" via 301 and we get an infinite redirect loop on the
+	// base host (no subdomain, no namespace in the path).
+	s.mux.HandleFunc("GET /{$}", s.handleBaseRoot)
+	s.mux.HandleFunc("HEAD /{$}", s.handleBaseRoot)
+
 	// Admin plane under /_/. Namespace names cannot start with `_`, so this
 	// prefix never collides with object-plane routing.
 	s.mux.HandleFunc("POST /_/namespaces", s.handleAdminNamespaceCreate)
@@ -132,6 +138,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status": "ok",
 	})
+}
+
+func (s *Server) handleBaseRoot(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 func (s *Server) handlePathFallback(w http.ResponseWriter, r *http.Request) {

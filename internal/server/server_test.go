@@ -681,6 +681,23 @@ func TestAdminRejectInvalidNamespace(t *testing.T) {
 	}
 }
 
+// TestBaseRootDoesNotRedirect guards against a regression where Go's
+// ServeMux returned 301 -> "/" on a bare base-host request and caused an
+// infinite redirect loop in browsers.
+func TestBaseRootDoesNotRedirect(t *testing.T) {
+	ts := buildServer(t, nil)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec := httptest.NewRecorder()
+		ts.srv.ServeHTTP(rec, authedReq(method, "/", "", nil))
+		if rec.Code == http.StatusMovedPermanently || rec.Code == http.StatusFound {
+			t.Fatalf("%s / returned redirect %d (Location=%q); want 404", method, rec.Code, rec.Header().Get("Location"))
+		}
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s / status = %d, want 404", method, rec.Code)
+		}
+	}
+}
+
 func TestAdminUnderscorePrefixPathFallback(t *testing.T) {
 	ts := buildServer(t, nil)
 	rec := httptest.NewRecorder()
