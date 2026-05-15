@@ -292,11 +292,16 @@ BASE="http://127.0.0.1:$PORT"
 step "GET /healthz returns 200"
 expect "$(http_status "$BASE/healthz")" "200"
 
-step "POST /_/namespaces creates default with owner"
+step "POST /_/namespaces creates default with owner, public_read=true, index.html"
 out=$(admin_call POST "$ADMIN" "$ROOT_TOKEN" '{"name":"default"}' 2>&1)
 OWNER_TOKEN=$(read_json_field "$out" owner_token)
-if [[ -n "$OWNER_TOKEN" && "$OWNER_TOKEN" == pcd_* ]]; then ok
-else ko "no owner_token in: $out"; fi
+if [[ -n "$OWNER_TOKEN" && "$OWNER_TOKEN" == pcd_* ]] \
+   && echo "$out" | grep -q '"public_read":true' \
+   && echo "$out" | grep -q '"index_file":"index.html"'; then ok
+else ko "missing fields: $out"; fi
+
+# selftest checks the private branch later via explicit set; flip off now.
+admin_call POST "$ADMIN/default/public" "$OWNER_TOKEN" '{"on":false}' >/dev/null
 
 step "namespaces/default.json has mode 0600"
 mode=$(stat -c '%a' "$DATA/namespaces/default.json" 2>/dev/null)

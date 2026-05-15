@@ -216,6 +216,10 @@ func TestAuthRequired(t *testing.T) {
 // namespace from a private one. Both must return 401, never 404.
 func TestNamespaceExistenceNotLeaked(t *testing.T) {
 	ts := buildServer(t, nil)
+	// flip default off — this test is about the private branch
+	if err := ts.authStore.SetPublicRead("default", false); err != nil {
+		t.Fatal(err)
+	}
 	// anon to private existing ns
 	rec := httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/x.txt", "", nil))
@@ -605,22 +609,54 @@ func TestAdminSetPublic(t *testing.T) {
 	if rec := doPut(t, ts.srv, "", "/default/p.txt", ts.ownerToken, "body", "text/plain"); rec.Code != http.StatusCreated {
 		t.Fatalf("seed PUT status = %d", rec.Code)
 	}
-	// no anon read yet
+	// default is public — anon read works
 	rec := httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/p.txt", "", nil))
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default-public anon read status = %d, want 200", rec.Code)
 	}
-	// flip public on
+	// flip public off
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/public", ts.ownerToken, map[string]bool{"on": false}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set public off status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/p.txt", "", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("after public off, anon read status = %d, want 401", rec.Code)
+	}
+	// flip back on
 	rec = httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces/default/public", ts.ownerToken, map[string]bool{"on": true}))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("set public on status = %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
 	ts.srv.ServeHTTP(rec, authedReq(http.MethodGet, "/default/p.txt", "", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("anon read status = %d", rec.Code)
+		t.Fatalf("anon read after re-enable status = %d", rec.Code)
+	}
+}
+
+func TestNamespaceCreateReportsDefaults(t *testing.T) {
+	ts := buildServer(t, nil)
+	rec := httptest.NewRecorder()
+	ts.srv.ServeHTTP(rec, adminReq(http.MethodPost, "/_/namespaces", ts.rootToken, map[string]string{"name": "fresh"}))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Namespace  string `json:"namespace"`
+		PublicRead bool   `json:"public_read"`
+		IndexFile  string `json:"index_file"`
+	}
+	decodeJSON(t, rec.Body, &resp)
+	if !resp.PublicRead {
+		t.Fatal("new namespace should be public_read=true")
+	}
+	if resp.IndexFile != "index.html" {
+		t.Fatalf("index_file = %q, want index.html", resp.IndexFile)
 	}
 }
 

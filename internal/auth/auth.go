@@ -479,6 +479,7 @@ func (s *Store) CreateNamespace(name string) (*CreatedToken, error) {
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		OwnerTokenID: tok.ID,
+		PublicRead:   true, // default-on; turn off explicitly to make private
 		Tokens:       []Token{tok},
 	}
 	if err := s.persistLocked(ns); err != nil {

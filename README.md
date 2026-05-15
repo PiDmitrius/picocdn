@@ -271,10 +271,12 @@ curl -fsS -H "Authorization: Bearer $OWNER" \
      -d '{"on":false}' http://127.0.0.1:8080/_/namespaces/default/public
 ```
 
-When public-read is enabled, `GET`/`HEAD` on individual objects work without
-a token. **Listing always requires a token** even on public-read namespaces.
-`PUT`/`DELETE` still require the relevant permission. Cache-Control is relaxed
-to `public, max-age=300` for objects served from public namespaces.
+**New namespaces are public-read by default.** Anonymous `GET`/`HEAD` on
+individual objects work without a token; turn it off explicitly when you need a
+private namespace (`{"on":false}` on the `/public` endpoint above). **Listing
+always requires a token** even on public-read namespaces. `PUT`/`DELETE` still
+require the relevant permission. Cache-Control is relaxed to
+`public, max-age=300` for objects served from public namespaces.
 
 ## Directory index
 
